@@ -95,7 +95,29 @@ else
 end
 ```
 
-One block terminator — `end` — no `end-if` / `end-loop` / `end-function` variants.
+### Block terminators — bare `end` or `end <kind>`
+
+Any block may be closed with bare `end`, or with the two-token form naming the block kind:
+
+```
+if x is greater than 0
+    print "positive"
+end if
+
+repeat 10 times
+    print "hi"
+end repeat
+```
+
+Mixing styles across a file is allowed. Mismatched kinds are a compile error:
+
+```
+if x is greater than 0
+    print "oops"
+end repeat        # error: 'if' cannot be closed with 'end repeat'
+```
+
+The valid kinds are `if`, `repeat`, `function`, `record`.
 
 ---
 
@@ -126,6 +148,16 @@ Control inside a loop:
 ```
 stop                 # break
 skip                 # continue
+```
+
+### Note on `times` in `repeat N times`
+
+The word `times` is both the multiplication operator (`price times quantity`) and the iteration marker (`repeat 10 times`). At the top level of a `repeat` count, `times` is always the loop marker. For multiplication in the count, wrap it in parentheses:
+
+```
+repeat 10 times            # 10 iterations
+repeat 2 plus 3 times      # 5 iterations
+repeat (2 times 3) times   # 6 iterations — parens needed
 ```
 
 ---
