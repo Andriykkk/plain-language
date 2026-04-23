@@ -56,9 +56,32 @@ set total to (price times quantity) plus tax
 set average to sum divided by count
 ```
 
-Only one form per situation — `add 5 to total` has no expression-form twin.
+Only one statement form per situation — `add 5 to total` has no expression-form twin.
 
-**Word-based operators only** — `plus`, `minus`, `times`, `divided by`. No `+ - * /`.
+### Word operators and symbol operators
+
+Expressions accept both word and symbol forms for arithmetic; the AST is identical either way.
+
+| Word form       | Symbol | Example             |
+|-----------------|--------|---------------------|
+| `plus`          | `+`    | `a + b`             |
+| `minus`         | `-`    | `a - b`             |
+| `times`         | `*`    | `a * b`             |
+| `divided by`    | `/`    | `a / b`             |
+
+Same precedence rules in both forms: `*` / `/` / `times` / `divided by` bind tighter than `+` / `-` / `plus` / `minus`. Mixing styles in one expression is legal (`2 + 3 times 4` = 14) but keep one style per expression for readability.
+
+**Unary minus** is supported: `-5`, `-x`, `-(a + b)`. There is no `plus` / `+` unary form — just write the number.
+
+**Word form is the default style** for English-like code. Reach for symbols in math-heavy code and where word forms get in the way:
+
+```
+repeat for i from 0 to n - 1          # cleaner than 'n minus 1'
+set last to xs[length of xs - 1]
+set area to width * height
+```
+
+**Comparisons** are still word-only for now: `is equal to`, `is greater than`, etc. Symbolic forms (`<`, `>`, `==`, `!=`, `<=`, `>=`) are a deliberate future addition, not a current gap.
 
 ---
 

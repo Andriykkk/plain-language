@@ -13,6 +13,10 @@ class TK(Enum):
     RBRACKET = auto()
     DOT = auto()
     COMMA = auto()
+    PLUS = auto()
+    MINUS = auto()
+    STAR = auto()
+    SLASH = auto()
     NEWLINE = auto()
     EOF = auto()
 
@@ -111,6 +115,10 @@ def tokenize(source: str) -> list[Token]:
             "]": TK.RBRACKET,
             ".": TK.DOT,
             ",": TK.COMMA,
+            "+": TK.PLUS,
+            "-": TK.MINUS,
+            "*": TK.STAR,
+            "/": TK.SLASH,
         }
         if c in single:
             tokens.append(Token(single[c], i, i + 1))

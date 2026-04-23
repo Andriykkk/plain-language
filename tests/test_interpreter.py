@@ -34,6 +34,69 @@ class TestLiterals(unittest.TestCase):
         self.assertEqual(run_capture("set x to 3.14\nprint x\n"), "3.14\n")
 
 
+class TestSymbolicOperators(unittest.TestCase):
+    def test_plus_symbol(self):
+        self.assertEqual(run_capture("set x to 2 + 3\nprint x\n"), "5\n")
+
+    def test_minus_symbol(self):
+        self.assertEqual(run_capture("set x to 10 - 4\nprint x\n"), "6\n")
+
+    def test_star_symbol(self):
+        self.assertEqual(run_capture("set x to 6 * 7\nprint x\n"), "42\n")
+
+    def test_slash_symbol(self):
+        self.assertEqual(run_capture("set x to 10 / 4\nprint x\n"), "2.5\n")
+
+    def test_precedence_star_before_plus(self):
+        self.assertEqual(run_capture("set x to 2 + 3 * 4\nprint x\n"), "14\n")
+
+    def test_parens_override_precedence(self):
+        self.assertEqual(run_capture("set x to (2 + 3) * 4\nprint x\n"), "20\n")
+
+    def test_unary_minus_literal(self):
+        self.assertEqual(run_capture("set x to -5\nprint x\n"), "-5\n")
+
+    def test_unary_minus_expression(self):
+        self.assertEqual(run_capture("set x to -(2 + 3)\nprint x\n"), "-5\n")
+
+    def test_unary_minus_variable(self):
+        self.assertEqual(run_capture("set a to 7\nset b to -a\nprint b\n"), "-7\n")
+
+    def test_mix_symbols_and_words(self):
+        # symbols and words produce the same AST; this should compute 2 + 12 = 14
+        self.assertEqual(run_capture("set x to 2 + 3 times 4\nprint x\n"), "14\n")
+        self.assertEqual(run_capture("set x to 2 plus 3 * 4\nprint x\n"), "14\n")
+
+    def test_symbol_in_loop_bounds(self):
+        src = """set total to 0
+repeat for i from 0 to 10 - 1
+    add i to total
+end
+print total
+"""
+        self.assertEqual(run_capture(src), "45\n")
+
+    def test_symbol_in_index_math(self):
+        src = """set xs to empty list of number
+append 10 to xs
+append 20 to xs
+append 30 to xs
+print xs[length of xs - 1]
+"""
+        self.assertEqual(run_capture(src), "30\n")
+
+    def test_times_word_still_disabled_in_repeat_count(self):
+        # 'repeat N times' — the word 'times' remains the loop marker, not multiplication.
+        # Using '*' in the count is fine because the symbol doesn't collide.
+        src = """set n to 0
+repeat 2 * 3 times
+    add 1 to n
+end
+print n
+"""
+        self.assertEqual(run_capture(src), "6\n")
+
+
 class TestArithmetic(unittest.TestCase):
     def test_precedence_times_before_plus(self):
         self.assertEqual(run_capture("set x to 2 plus 3 times 4\nprint x\n"), "14\n")

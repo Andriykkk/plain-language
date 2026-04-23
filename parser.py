@@ -683,8 +683,15 @@ class Parser:
 
     def parse_addition(self, allow_times: bool = True) -> Expr:
         left = self.parse_multiplication(allow_times)
-        while self.match(TK.KEYWORD, "plus") or self.match(TK.KEYWORD, "minus"):
-            op = self.text(self.advance())
+        while True:
+            if self.match(TK.KEYWORD, "plus") or self.match(TK.PLUS):
+                self.advance()
+                op = "plus"
+            elif self.match(TK.KEYWORD, "minus") or self.match(TK.MINUS):
+                self.advance()
+                op = "minus"
+            else:
+                break
             right = self.parse_multiplication(allow_times)
             left = BinaryOp(op, left, right)
         return left
@@ -696,9 +703,18 @@ class Parser:
                 self.advance()
                 right = self.parse_primary()
                 left = BinaryOp("times", left, right)
+            elif self.match(TK.STAR):
+                # '*' is always allowed — it doesn't collide with the 'times' loop marker
+                self.advance()
+                right = self.parse_primary()
+                left = BinaryOp("times", left, right)
             elif self.match(TK.KEYWORD, "divided"):
                 self.advance()
                 self.consume(TK.KEYWORD, "by")
+                right = self.parse_primary()
+                left = BinaryOp("divided", left, right)
+            elif self.match(TK.SLASH):
+                self.advance()
                 right = self.parse_primary()
                 left = BinaryOp("divided", left, right)
             else:
@@ -706,6 +722,12 @@ class Parser:
         return left
 
     def parse_primary(self) -> Expr:
+        # unary minus: -x desugars to 0 - x. Higher precedence than binary ops.
+        if self.match(TK.MINUS):
+            self.advance()
+            inner = self.parse_primary()
+            return BinaryOp("minus", NumberLit(0), inner)
+
         expr = self._parse_atom()
         while True:
             if self.match(TK.DOT):
