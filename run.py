@@ -48,5 +48,11 @@ end
 
 print "a * b ="
 print c
+
+set m3d to empty matrix 2 by 2 by 2 of number
+set m3d[0, 0, 0] to 1
+set m3d[0, 0, 1] to 2
+
+print m3d
 '''
     run(demo)

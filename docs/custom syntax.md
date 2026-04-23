@@ -1,11 +1,3 @@
-Extensible PlainLang — design for a tree-walking interpreter
-You're describing a small core with a user-extensible surface. The right model for this has three pieces, all well-understood:
-
-Sentence-based calls (Smalltalk / Forth / Inform 7)
-Multiple dispatch (Julia / Common Lisp CLOS) — same name, different impls by argument types
-Pattern-based syntax extension (Rebol / Racket macros, simplified) — users declare surface forms
-Here's how they fit together.
-
 1. The core model: a sentence is a pattern call
 A line is a pattern plus slot values. The pattern add <a> to <b> with slots 5 and total becomes a call to an operation named add ... to ... with arguments (5, total).
 
