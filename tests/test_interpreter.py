@@ -297,6 +297,194 @@ class TestBlockEnd(unittest.TestCase):
             run_capture("repeat 1 times\n    print 1\nend if\n")
 
 
+class TestFunctions(unittest.TestCase):
+    def test_no_args_no_return(self):
+        src = """define function hello
+    print "hi"
+end
+
+call hello
+"""
+        self.assertEqual(run_capture(src), "hi\n")
+
+    def test_one_arg_with_return(self):
+        src = """define function double
+    input x as number
+    output as number
+
+    return x times 2
+end
+
+print call double with 21
+"""
+        self.assertEqual(run_capture(src), "42\n")
+
+    def test_multiple_args(self):
+        src = """define function add3
+    input a as number
+    input b as number
+    input c as number
+    output as number
+
+    return a plus b plus c
+end
+
+print call add3 with 1 and 2 and 3
+"""
+        self.assertEqual(run_capture(src), "6\n")
+
+    def test_call_as_statement_for_side_effects(self):
+        src = """define function greet
+    input name as text
+
+    print "hello" and name
+end
+
+call greet with "world"
+"""
+        self.assertEqual(run_capture(src), "hello world\n")
+
+    def test_recursion(self):
+        src = """define function fact
+    input n as number
+    output as number
+
+    if n is at most 1
+        return 1
+    end
+    return n times call fact with (n minus 1)
+end
+
+print call fact with 5
+"""
+        self.assertEqual(run_capture(src), "120\n")
+
+    def test_function_calling_function(self):
+        src = """define function square
+    input x as number
+    output as number
+
+    return x times x
+end
+
+define function square_plus_one
+    input x as number
+    output as number
+
+    return (call square with x) plus 1
+end
+
+print call square_plus_one with 4
+"""
+        self.assertEqual(run_capture(src), "17\n")
+
+    def test_bare_return_gives_none(self):
+        src = """define function nothing
+    return
+end
+
+set x to call nothing
+print x
+"""
+        self.assertEqual(run_capture(src), "None\n")
+
+    def test_falls_off_end_gives_none(self):
+        src = """define function noop
+    set _ to 1
+end
+
+set x to call noop
+print x
+"""
+        self.assertEqual(run_capture(src), "None\n")
+
+    def test_function_local_scope_isolated(self):
+        # A function's local variables should not bleed into the caller.
+        src = """define function scoped
+    set local_var to 999
+end
+
+call scoped
+set local_var to 1
+print local_var
+"""
+        self.assertEqual(run_capture(src), "1\n")
+
+    def test_function_sees_top_level_functions_not_caller_locals(self):
+        # Functions must see other functions (top-level) but NOT caller's local variables.
+        src = """define function uses_helper
+    return call helper
+end
+
+define function helper
+    output as number
+
+    return 42
+end
+
+print call uses_helper
+"""
+        self.assertEqual(run_capture(src), "42\n")
+
+    def test_return_value_in_expression(self):
+        src = """define function five
+    output as number
+
+    return 5
+end
+
+print (call five) plus 10
+"""
+        self.assertEqual(run_capture(src), "15\n")
+
+    def test_end_function_closes_function(self):
+        src = """define function f
+    return 1
+end function
+
+print call f
+"""
+        self.assertEqual(run_capture(src), "1\n")
+
+    def test_mismatched_end_if_on_function_errors(self):
+        src = """define function f
+    return 1
+end if
+"""
+        with self.assertRaises(ParseError):
+            run_capture(src)
+
+
+class TestFunctionErrors(unittest.TestCase):
+    def test_undefined_function(self):
+        with self.assertRaises(RunError):
+            run_capture("call missing\n")
+
+    def test_wrong_arg_count(self):
+        src = """define function f
+    input x as number
+    output as number
+
+    return x
+end
+
+print call f with 1 and 2
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_return_outside_function(self):
+        with self.assertRaises(RunError):
+            run_capture("return 5\n")
+
+    def test_calling_a_non_function(self):
+        src = """set x to 5
+print call x
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+
 class TestErrors(unittest.TestCase):
     def test_undefined_variable(self):
         with self.assertRaises(RunError):

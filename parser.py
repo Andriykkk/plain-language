@@ -45,7 +45,19 @@ class Compare:
     right: "Expr"
 
 
-Expr = Union[NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare]
+@dataclass
+class CallExpr:
+    name: str
+    args: list["Expr"]
+
+
+@dataclass
+class TypeRef:
+    name: str
+    inner: list["TypeRef"]
+
+
+Expr = Union[NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare, CallExpr]
 
 
 @dataclass
@@ -127,10 +139,29 @@ class SkipStmt:
     pass
 
 
+@dataclass
+class FunctionDef:
+    name: str
+    params: list[tuple[str, TypeRef]]
+    return_type: TypeRef | None
+    body: list["Stmt"]
+
+
+@dataclass
+class ReturnStmt:
+    value: Expr | None
+
+
+@dataclass
+class CallStmt:
+    call: CallExpr
+
+
 Stmt = Union[
     SetStmt, AddStmt, SubtractStmt, MultiplyStmt, DivideStmt, PrintStmt,
     IfStmt, RepeatTimesStmt, RepeatForEachStmt, RepeatRangeStmt, RepeatWhileStmt,
     StopStmt, SkipStmt,
+    FunctionDef, ReturnStmt, CallStmt,
 ]
 
 
@@ -262,6 +293,9 @@ class Parser:
             if word == "print":    return self.parse_print()
             if word == "if":       return self.parse_if()
             if word == "repeat":   return self.parse_repeat()
+            if word == "define":   return self.parse_define()
+            if word == "return":   return self.parse_return()
+            if word == "call":     return CallStmt(self.parse_call())
             if word == "stop":
                 self.advance()
                 return StopStmt()
@@ -373,6 +407,86 @@ class Parser:
         self.consume_block_end("repeat", opener)
         return RepeatTimesStmt(count, body)
 
+    def parse_define(self) -> Stmt:
+        opener = self.consume(TK.KEYWORD, "define")
+        if self.match(TK.KEYWORD, "function"):
+            return self.parse_function_def(opener)
+        tok = self.peek()
+        raise ParseError(
+            f"expected 'function' after 'define', got {self.text(tok)!r}", tok
+        )
+
+    def parse_function_def(self, opener: Token) -> FunctionDef:
+        self.consume(TK.KEYWORD, "function")
+        name = self.text(self.consume(TK.IDENT))
+        self._end_of_statement()
+
+        params: list[tuple[str, TypeRef]] = []
+        return_type: TypeRef | None = None
+
+        while True:
+            if self.match(TK.KEYWORD, "input"):
+                self.advance()
+                pname = self.text(self.consume(TK.IDENT))
+                self.consume(TK.KEYWORD, "as")
+                ptype = self.parse_type()
+                params.append((pname, ptype))
+                self._end_of_statement()
+            elif self.match(TK.KEYWORD, "output"):
+                self.advance()
+                self.consume(TK.KEYWORD, "as")
+                return_type = self.parse_type()
+                self._end_of_statement()
+            else:
+                break
+
+        body = self.parse_block_until({"end"})
+        self.consume_block_end("function", opener)
+        return FunctionDef(name, params, return_type, body)
+
+    def parse_type(self) -> TypeRef:
+        if self.match(TK.KEYWORD, "list"):
+            self.advance()
+            self.consume(TK.KEYWORD, "of")
+            inner = self.parse_type()
+            return TypeRef("list", [inner])
+        if self.match(TK.KEYWORD, "map"):
+            self.advance()
+            self.consume(TK.KEYWORD, "of")
+            key = self.parse_type()
+            self.consume(TK.KEYWORD, "to")
+            value = self.parse_type()
+            return TypeRef("map", [key, value])
+        tok = self.peek()
+        if tok.kind == TK.IDENT:
+            self.advance()
+            return TypeRef(self.text(tok), [])
+        if tok.kind == TK.KEYWORD:
+            # allow keyword-ish type names that are also keywords in other contexts
+            # (none currently, but leaves room for future 'number'/'text' as keywords)
+            raise ParseError(f"expected type name, got keyword {self.text(tok)!r}", tok)
+        raise ParseError(f"expected type name, got {self.text(tok)!r}", tok)
+
+    def parse_call(self) -> CallExpr:
+        self.consume(TK.KEYWORD, "call")
+        name = self.text(self.consume(TK.IDENT))
+        args: list[Expr] = []
+        if self.match(TK.KEYWORD, "with"):
+            self.advance()
+            args.append(self.parse_expression())
+            while self.match(TK.KEYWORD, "and"):
+                self.advance()
+                args.append(self.parse_expression())
+        return CallExpr(name, args)
+
+    def parse_return(self) -> ReturnStmt:
+        self.consume(TK.KEYWORD, "return")
+        tok = self.peek()
+        if tok.kind in (TK.NEWLINE, TK.EOF):
+            return ReturnStmt(None)
+        value = self.parse_expression()
+        return ReturnStmt(value)
+
     # ---- expressions ----
 
     def parse_expression(self) -> Expr:
@@ -461,6 +575,8 @@ class Parser:
 
         if tok.kind == TK.KEYWORD:
             word = self.text(tok)
+            if word == "call":
+                return self.parse_call()
             if word == "true":
                 self.advance()
                 return BoolLit(True)

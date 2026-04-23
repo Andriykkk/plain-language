@@ -11,37 +11,36 @@ def run(source: str) -> None:
 
 if __name__ == "__main__":
     demo = '''# demo
-set total to 0
-repeat for i from 1 to 5
-    add i to total
-end
-print "sum 1..5 is" and total
+define function square
+    input x as number
+    output as number
 
-if total is greater than 10
-    print "big"
-else if total is equal to 10
-    print "exactly ten"
-else
-    print "small"
-end if
+    return x times x
+end function
 
-set n to 1
-repeat while n is less than 20
-    multiply n by 2
-end repeat
-print "n is" and n
+define function sum_to
+    input n as number
+    output as number
 
-set seen to 0
-repeat 10 times
-    add 1 to seen
-    if seen is equal to 3
-        skip
+    set total to 0
+    repeat for i from 1 to n
+        add i to total
     end
-    if seen is at least 7
-        stop
-    end
-    print "seen is" and seen
+    return total
 end
-print "final seen is" and seen
+
+define function factorial
+    input n as number
+    output as number
+
+    if n is at most 1
+        return 1
+    end
+    return n times call factorial with (n minus 1)
+end
+
+print "square of 7 is" and call square with 7
+print "sum 1..10 is" and call sum_to with 10
+print "5! is" and call factorial with 5
 '''
     run(demo)
