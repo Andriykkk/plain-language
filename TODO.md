@@ -1,2 +1,4 @@
 [ ] add list initialisation
-[ ]
+[ ] rows of / columns of only make sense for 2D+. For 3D+, you'd want size of m at dimension N or a shape of m returning a list. Leaving for when you actually need it.
+All matrix element types go into a Python list right now. When you get to the C-backend stage, matrix of number is the one that should specialize to a contiguous typed array for real performance. The AST already carries elem_type, so that's pure codegen work — no user-facing change.
+Matrices are not growable (by design). If you later want appendable fixed-width rows, that's a different container (buffer? grid?) — don't overload matrix

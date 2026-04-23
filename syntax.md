@@ -226,7 +226,7 @@ Field access uses `.` — the one symbol that survived.
 set prices to empty list of number
 append 10 to prices
 append 20 to prices
-set first_price to prices[1]      # 1-indexed, COBOL/Lua/Julia-style
+set first_price to prices[0]      # 0-indexed, C/Python-style
 set count to length of prices
 
 set ages to empty map of text to number
@@ -234,7 +234,56 @@ set ages["Alice"] to 30
 set bob_age to ages["Bob"]
 ```
 
-One-indexed lists fits the "readable to non-programmers" audience.
+Indexing is **0-based**: the first element is `xs[0]`, the last is `xs[(length of xs) minus 1]`. Same convention as C, Python, Rust — closer to how memory works, and avoids subtle off-by-one errors when doing index math. To iterate a list of length `n` by index: `repeat for i from 0 to n minus 1`.
+
+---
+
+## 9b. Matrices — fixed-shape, N-dimensional
+
+Use `matrix` when you want a grid with fixed dimensions and contiguous storage, not a jagged list-of-lists. Indexing uses a single bracket pair with comma-separated indices, COBOL-style.
+
+```
+# 2D — 3 rows by 4 columns of numbers
+set g to empty matrix 3 by 4 of number
+set g[0, 0] to 42
+add 1 to g[1, 2]
+print g[0, 0]
+
+# introspection
+print rows of g           # 3
+print columns of g        # 4
+print length of g         # 12 (total cells)
+
+# nested loops to fill a multiplication table
+set table to empty matrix 5 by 5 of number
+repeat for i from 0 to 4
+    repeat for j from 0 to 4
+        set table[i, j] to (i plus 1) times (j plus 1)
+    end
+end
+```
+
+Higher dimensions work the same way:
+
+```
+set cube to empty matrix 10 by 10 by 10 of number
+set cube[x, y, z] to value
+```
+
+Rules:
+- **Fixed shape.** Dimensions are set at creation; you can't grow a matrix. Use a `list` if you need to grow.
+- **0-indexed.** `m[0, 0]` is the first cell; matches `list[0]`.
+- **Row-major storage.** Under the hood, one flat buffer. A future compiler can swap in SIMD/GPU loops without changing your code.
+- **Any element type.** `matrix ... of number`, `matrix ... of text`, `matrix ... of Person` all work.
+- **Default values per type:** `number` → 0, `text` → `""`, record/other → `none`.
+- **Iteration.** `repeat for each v in m` visits every cell in row-major order. For per-row/per-column work, use nested `repeat for i from 0 to (rows of m) minus 1`.
+
+Matrices vs lists:
+- **matrix** — fixed shape, numeric or record grids, math/image/simulation work.
+- **list** — variable length, append-heavy, collection of things where order matters but size doesn't.
+- **map** — keyed lookups, variable size.
+
+Pick the one that matches intent. Using a list-of-lists for a fixed grid is a code smell.
 
 ---
 
@@ -304,12 +353,14 @@ repeat times for each in from to while
 stop skip
 define function record input output return
 call with and
-new empty list map of
+new empty list map matrix of
+append
+length rows columns
 print
 true false none
 ```
 
-~40 words. Everything else is a user identifier or a user-defined operation.
+~45 words. Everything else is a user identifier or a user-defined operation.
 
 ---
 

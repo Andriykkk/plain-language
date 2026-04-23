@@ -597,18 +597,18 @@ class TestLists(unittest.TestCase):
 append 10 to xs
 append 20 to xs
 print length of xs
+print xs[0]
 print xs[1]
-print xs[2]
 """
         self.assertEqual(run_capture(src), "2\n10\n20\n")
 
-    def test_list_is_one_indexed(self):
+    def test_list_is_zero_indexed(self):
         src = """set xs to empty list of number
 append 100 to xs
 append 200 to xs
 append 300 to xs
-print xs[1]
-print xs[3]
+print xs[0]
+print xs[2]
 """
         self.assertEqual(run_capture(src), "100\n300\n")
 
@@ -617,8 +617,8 @@ print xs[3]
 append 1 to xs
 append 2 to xs
 append 3 to xs
-set xs[2] to 99
-print xs[2]
+set xs[1] to 99
+print xs[1]
 """
         self.assertEqual(run_capture(src), "99\n")
 
@@ -626,8 +626,8 @@ print xs[2]
         src = """set xs to empty list of number
 append 10 to xs
 append 20 to xs
-add 5 to xs[1]
-print xs[1]
+add 5 to xs[0]
+print xs[0]
 """
         self.assertEqual(run_capture(src), "15\n")
 
@@ -692,6 +692,161 @@ print m["x"]
         self.assertEqual(run_capture(src), "15\n")
 
 
+class TestMatrices(unittest.TestCase):
+    def test_2d_matrix_defaults_to_zero(self):
+        src = """set g to empty matrix 2 by 3 of number
+print g[0, 0]
+print g[1, 2]
+print length of g
+"""
+        self.assertEqual(run_capture(src), "0\n0\n6\n")
+
+    def test_set_and_read_cells(self):
+        src = """set g to empty matrix 3 by 3 of number
+set g[0, 0] to 10
+set g[1, 1] to 20
+set g[2, 2] to 30
+print g[0, 0]
+print g[1, 1]
+print g[2, 2]
+"""
+        self.assertEqual(run_capture(src), "10\n20\n30\n")
+
+    def test_rows_and_columns(self):
+        src = """set g to empty matrix 4 by 7 of number
+print rows of g
+print columns of g
+"""
+        self.assertEqual(run_capture(src), "4\n7\n")
+
+    def test_add_to_cell(self):
+        src = """set g to empty matrix 2 by 2 of number
+set g[0, 0] to 5
+add 3 to g[0, 0]
+print g[0, 0]
+"""
+        self.assertEqual(run_capture(src), "8\n")
+
+    def test_multiply_cell(self):
+        src = """set g to empty matrix 2 by 2 of number
+set g[1, 0] to 4
+multiply g[1, 0] by 3
+print g[1, 0]
+"""
+        self.assertEqual(run_capture(src), "12\n")
+
+    def test_3d_matrix(self):
+        src = """set cube to empty matrix 2 by 2 by 2 of number
+set cube[0, 0, 0] to 1
+set cube[1, 1, 1] to 8
+print length of cube
+print cube[0, 0, 0]
+print cube[1, 1, 1]
+"""
+        self.assertEqual(run_capture(src), "8\n1\n8\n")
+
+    def test_matrix_of_text(self):
+        src = """set labels to empty matrix 2 by 2 of text
+set labels[0, 0] to "NW"
+set labels[1, 1] to "SE"
+print labels[0, 0]
+print labels[1, 1]
+print labels[0, 1]
+"""
+        # empty text default is ""
+        self.assertEqual(run_capture(src), "NW\nSE\n\n")
+
+    def test_nested_iteration_sum(self):
+        src = """set g to empty matrix 3 by 3 of number
+repeat for i from 0 to 2
+    repeat for j from 0 to 2
+        set g[i, j] to i plus j
+    end
+end
+set total to 0
+repeat for i from 0 to 2
+    repeat for j from 0 to 2
+        add g[i, j] to total
+    end
+end
+print total
+"""
+        # Sum of i+j for i in 0..2, j in 0..2 = 3*(0+1+2) + 3*(0+1+2) = 9+9 = 18
+        self.assertEqual(run_capture(src), "18\n")
+
+    def test_for_each_iterates_flat(self):
+        src = """set g to empty matrix 2 by 2 of number
+set g[0, 0] to 1
+set g[0, 1] to 2
+set g[1, 0] to 3
+set g[1, 1] to 4
+set total to 0
+repeat for each v in g
+    add v to total
+end
+print total
+"""
+        self.assertEqual(run_capture(src), "10\n")
+
+    def test_wrong_number_of_indices_errors(self):
+        src = """set g to empty matrix 2 by 2 of number
+print g[0]
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_out_of_range_errors(self):
+        src = """set g to empty matrix 2 by 2 of number
+print g[2, 0]
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_multi_index_on_list_errors(self):
+        src = """set xs to empty list of number
+append 1 to xs
+print xs[0, 0]
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_rows_of_non_matrix_errors(self):
+        with self.assertRaises(RunError):
+            run_capture("set xs to empty list of number\nprint rows of xs\n")
+
+    def test_matrix_multiply(self):
+        # integration test — small 2x2 matrix multiply
+        src = """set a to empty matrix 2 by 2 of number
+set a[0, 0] to 1
+set a[0, 1] to 2
+set a[1, 0] to 3
+set a[1, 1] to 4
+
+set b to empty matrix 2 by 2 of number
+set b[0, 0] to 5
+set b[0, 1] to 6
+set b[1, 0] to 7
+set b[1, 1] to 8
+
+set c to empty matrix 2 by 2 of number
+repeat for i from 0 to 1
+    repeat for j from 0 to 1
+        set sum to 0
+        repeat for k from 0 to 1
+            add a[i, k] times b[k, j] to sum
+        end
+        set c[i, j] to sum
+    end
+end
+print c[0, 0]
+print c[0, 1]
+print c[1, 0]
+print c[1, 1]
+"""
+        # [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]]
+        self.assertEqual(run_capture(src), "19\n22\n43\n50\n")
+
+
 class TestListsOfRecords(unittest.TestCase):
     def test_append_record_and_access_fields(self):
         src = """define record Item
@@ -711,8 +866,8 @@ set b.name to "bread"
 set b.price to 5
 append b to items
 
-print items[1].name
-print items[2].price
+print items[0].name
+print items[1].price
 
 set total to 0
 repeat for each it in items

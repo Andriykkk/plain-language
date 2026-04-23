@@ -12,6 +12,7 @@ class TK(Enum):
     LBRACKET = auto()
     RBRACKET = auto()
     DOT = auto()
+    COMMA = auto()
     NEWLINE = auto()
     EOF = auto()
 
@@ -33,9 +34,9 @@ KEYWORDS = {
     "stop", "skip",
     "define", "function", "record", "input", "output", "return",
     "call", "with", "and",
-    "new", "empty", "list", "map", "of",
+    "new", "empty", "list", "map", "matrix", "of",
     "append",
-    "length",
+    "length", "rows", "columns",
     "print",
     "true", "false", "none",
 }
@@ -109,6 +110,7 @@ def tokenize(source: str) -> list[Token]:
             "[": TK.LBRACKET,
             "]": TK.RBRACKET,
             ".": TK.DOT,
+            ",": TK.COMMA,
         }
         if c in single:
             tokens.append(Token(single[c], i, i + 1))

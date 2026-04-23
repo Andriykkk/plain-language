@@ -68,7 +68,7 @@ class FieldAccess:
 @dataclass
 class IndexAccess:
     obj: "Expr"
-    index: "Expr"
+    indices: list["Expr"]
 
 
 @dataclass
@@ -88,13 +88,30 @@ class EmptyMap:
 
 
 @dataclass
+class EmptyMatrix:
+    dims: list["Expr"]
+    elem_type: TypeRef
+
+
+@dataclass
 class LengthExpr:
+    value: "Expr"
+
+
+@dataclass
+class RowsExpr:
+    value: "Expr"
+
+
+@dataclass
+class ColumnsExpr:
     value: "Expr"
 
 
 Expr = Union[
     NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare, CallExpr,
-    FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap, LengthExpr,
+    FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap, EmptyMatrix,
+    LengthExpr, RowsExpr, ColumnsExpr,
 ]
 
 
@@ -114,7 +131,7 @@ class FieldLValue:
 @dataclass
 class IndexLValue:
     obj: Expr
-    index: Expr
+    indices: list[Expr]
 
 
 LValue = Union[VarLValue, FieldLValue, IndexLValue]
@@ -598,9 +615,12 @@ class Parser:
                 current = FieldAccess(current, field)
             elif self.match(TK.LBRACKET):
                 self.advance()
-                index = self.parse_expression()
+                indices = [self.parse_expression()]
+                while self.match(TK.COMMA):
+                    self.advance()
+                    indices.append(self.parse_expression())
                 self.consume(TK.RBRACKET)
-                current = IndexAccess(current, index)
+                current = IndexAccess(current, indices)
             else:
                 break
         if isinstance(current, VarRef):
@@ -608,7 +628,7 @@ class Parser:
         if isinstance(current, FieldAccess):
             return FieldLValue(current.obj, current.field)
         if isinstance(current, IndexAccess):
-            return IndexLValue(current.obj, current.index)
+            return IndexLValue(current.obj, current.indices)
         raise ParseError("invalid assignment target", name_tok)
 
     # ---- expressions ----
@@ -694,9 +714,12 @@ class Parser:
                 expr = FieldAccess(expr, field)
             elif self.match(TK.LBRACKET):
                 self.advance()
-                index = self.parse_expression()
+                indices = [self.parse_expression()]
+                while self.match(TK.COMMA):
+                    self.advance()
+                    indices.append(self.parse_expression())
                 self.consume(TK.RBRACKET)
-                expr = IndexAccess(expr, index)
+                expr = IndexAccess(expr, indices)
             else:
                 break
         return expr
@@ -714,6 +737,10 @@ class Parser:
                 return self.parse_empty()
             if word == "length":
                 return self.parse_length()
+            if word == "rows":
+                return self.parse_rows()
+            if word == "columns":
+                return self.parse_columns()
             if word == "true":
                 self.advance()
                 return BoolLit(True)
@@ -764,9 +791,18 @@ class Parser:
             self.consume(TK.KEYWORD, "to")
             value = self.parse_type()
             return EmptyMap(key, value)
+        if self.match(TK.KEYWORD, "matrix"):
+            self.advance()
+            dims = [self.parse_addition()]
+            while self.match(TK.KEYWORD, "by"):
+                self.advance()
+                dims.append(self.parse_addition())
+            self.consume(TK.KEYWORD, "of")
+            elem = self.parse_type()
+            return EmptyMatrix(dims, elem)
         tok = self.peek()
         raise ParseError(
-            f"expected 'list' or 'map' after 'empty', got {self.text(tok)!r}", tok
+            f"expected 'list', 'map' or 'matrix' after 'empty', got {self.text(tok)!r}", tok
         )
 
     def parse_length(self) -> LengthExpr:
@@ -774,6 +810,18 @@ class Parser:
         self.consume(TK.KEYWORD, "of")
         value = self.parse_primary()
         return LengthExpr(value)
+
+    def parse_rows(self) -> RowsExpr:
+        self.consume(TK.KEYWORD, "rows")
+        self.consume(TK.KEYWORD, "of")
+        value = self.parse_primary()
+        return RowsExpr(value)
+
+    def parse_columns(self) -> ColumnsExpr:
+        self.consume(TK.KEYWORD, "columns")
+        self.consume(TK.KEYWORD, "of")
+        value = self.parse_primary()
+        return ColumnsExpr(value)
 
 
 def decode_string(raw: str) -> str:

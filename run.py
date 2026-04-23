@@ -10,55 +10,43 @@ def run(source: str) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''# demo — records, lists, maps
+    demo = '''# demo — matrices (zero-indexed)
 
-define record Order
-    customer as text
-    amount as number
-end
-
-define function total_of
-    input orders as list of Order
-    output as number
-
-    set total to 0
-    repeat for each order in orders
-        add order.amount to total
+# 5x5 multiplication table
+set table to empty matrix 5 by 5 of number
+repeat for i from 0 to 4
+    repeat for j from 0 to 4
+        set table[i, j] to (i plus 1) times (j plus 1)
     end
-    return total
+end
+print "multiplication table:"
+print table
+
+# 2x2 matrix multiply: [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]]
+set a to empty matrix 2 by 2 of number
+set a[0, 0] to 1
+set a[0, 1] to 2
+set a[1, 0] to 3
+set a[1, 1] to 4
+
+set b to empty matrix 2 by 2 of number
+set b[0, 0] to 5
+set b[0, 1] to 6
+set b[1, 0] to 7
+set b[1, 1] to 8
+
+set c to empty matrix 2 by 2 of number
+repeat for i from 0 to 1
+    repeat for j from 0 to 1
+        set sum to 0
+        repeat for k from 0 to 1
+            add a[i, k] times b[k, j] to sum
+        end
+        set c[i, j] to sum
+    end
 end
 
-set orders to empty list of Order
-
-set o1 to new Order
-set o1.customer to "Alice"
-set o1.amount to 100
-append o1 to orders
-
-set o2 to new Order
-set o2.customer to "Bob"
-set o2.amount to 250
-append o2 to orders
-
-set o3 to new Order
-set o3.customer to "Carol"
-set o3.amount to 75
-append o3 to orders
-
-set grand_total to call total_of with orders
-print "order count:" and length of orders
-print "grand total:" and grand_total
-
-if grand_total is greater than 300
-    print "big batch"
-else
-    print "small batch"
-end
-
-set prices_by_item to empty map of text to number
-set prices_by_item["apple"] to 1.5
-set prices_by_item["bread"] to 3.0
-set prices_by_item["milk"] to 2.75
-print "apple costs" and prices_by_item["apple"]
+print "a * b ="
+print c
 '''
     run(demo)

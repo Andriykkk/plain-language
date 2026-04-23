@@ -3,12 +3,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from parser import (
-    AddStmt, AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, Compare,
-    DivideStmt, EmptyList, EmptyMap, Expr, FieldAccess, FieldLValue, FunctionDef,
-    IfStmt, IndexAccess, IndexLValue, LengthExpr, LValue, MultiplyStmt, NewExpr,
-    NoneLit, NumberLit, PrintStmt, RecordDef, RepeatForEachStmt, RepeatRangeStmt,
-    RepeatTimesStmt, RepeatWhileStmt, ReturnStmt, SetStmt, SkipStmt, Stmt,
-    StopStmt, StringLit, SubtractStmt, TypeRef, VarLValue, VarRef,
+    AddStmt, AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, ColumnsExpr,
+    Compare, DivideStmt, EmptyList, EmptyMap, EmptyMatrix, Expr, FieldAccess,
+    FieldLValue, FunctionDef, IfStmt, IndexAccess, IndexLValue, LengthExpr,
+    LValue, MultiplyStmt, NewExpr, NoneLit, NumberLit, PrintStmt, RecordDef,
+    RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt,
+    ReturnStmt, RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt, StringLit,
+    SubtractStmt, TypeRef, VarLValue, VarRef,
 )
 
 
@@ -41,6 +42,28 @@ class RecordValue:
     def __repr__(self) -> str:
         parts = [f"{k}={v!r}" for k, v in self.fields.items()]
         return f"{self.type_name}({', '.join(parts)})"
+
+
+@dataclass(repr=False)
+class MatrixValue:
+    shape: tuple[int, ...]
+    data: list[Any]
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __repr__(self) -> str:
+        if len(self.shape) == 2:
+            rows, cols = self.shape
+            formatted_rows = []
+            for r in range(rows):
+                row_slice = self.data[r * cols:(r + 1) * cols]
+                formatted_rows.append("[" + ", ".join(repr(v) for v in row_slice) + "]")
+            return "[" + ", ".join(formatted_rows) + "]"
+        return f"matrix{self.shape}({self.data!r})"
 
 
 class _BreakSignal(Exception):
@@ -241,8 +264,8 @@ def evaluate(expr: Expr, env: Env) -> object:
 
     if isinstance(expr, IndexAccess):
         obj = evaluate(expr.obj, env)
-        index = evaluate(expr.index, env)
-        return _index_read(obj, index)
+        indices = [evaluate(i, env) for i in expr.indices]
+        return _index_read(obj, indices)
 
     if isinstance(expr, NewExpr):
         rt = env.get(expr.type_name)
@@ -258,23 +281,76 @@ def evaluate(expr: Expr, env: Env) -> object:
     if isinstance(expr, EmptyMap):
         return {}
 
+    if isinstance(expr, EmptyMatrix):
+        dims = [int(evaluate(d, env)) for d in expr.dims]
+        for d in dims:
+            if d < 0:
+                raise RunError(f"matrix dimension must be non-negative, got {d}")
+        total = 1
+        for d in dims:
+            total *= d
+        default = _default_for(expr.elem_type)
+        return MatrixValue(tuple(dims), [default] * total)
+
     if isinstance(expr, LengthExpr):
         value = evaluate(expr.value, env)
-        if isinstance(value, (list, dict, str)):
+        if isinstance(value, (list, dict, str, MatrixValue)):
             return len(value)
         raise RunError(f"cannot take length of value of type {type(value).__name__}")
+
+    if isinstance(expr, RowsExpr):
+        value = evaluate(expr.value, env)
+        if not isinstance(value, MatrixValue):
+            raise RunError(f"'rows of' requires a matrix, got {type(value).__name__}")
+        if not value.shape:
+            return 0
+        return value.shape[0]
+
+    if isinstance(expr, ColumnsExpr):
+        value = evaluate(expr.value, env)
+        if not isinstance(value, MatrixValue):
+            raise RunError(f"'columns of' requires a matrix, got {type(value).__name__}")
+        if len(value.shape) < 2:
+            raise RunError("matrix has no second dimension")
+        return value.shape[1]
 
     raise RunError(f"unknown expression: {expr!r}")
 
 
-def _index_read(obj: Any, index: Any) -> Any:
+def _matrix_offset(matrix: MatrixValue, indices: list) -> int:
+    if len(indices) != len(matrix.shape):
+        raise RunError(
+            f"matrix has {len(matrix.shape)} dimension(s), got {len(indices)} "
+            f"index/indices"
+        )
+    offset = 0
+    stride = 1
+    for dim, idx in zip(reversed(matrix.shape), reversed(indices)):
+        i0 = int(idx)
+        if i0 < 0 or i0 >= dim:
+            raise RunError(
+                f"matrix index {idx} out of range for dimension of size {dim}"
+            )
+        offset += i0 * stride
+        stride *= dim
+    return offset
+
+
+def _index_read(obj: Any, indices: list) -> Any:
+    if isinstance(obj, MatrixValue):
+        return obj.data[_matrix_offset(obj, indices)]
+    if len(indices) != 1:
+        raise RunError(
+            f"multi-index access requires a matrix, got {type(obj).__name__}"
+        )
+    index = indices[0]
     if isinstance(obj, list):
-        i = int(index) - 1
+        i = int(index)
         if i < 0 or i >= len(obj):
             raise RunError(f"list index {index} out of range (length {len(obj)})")
         return obj[i]
     if isinstance(obj, str):
-        i = int(index) - 1
+        i = int(index)
         if i < 0 or i >= len(obj):
             raise RunError(f"string index {index} out of range (length {len(obj)})")
         return obj[i]
@@ -301,9 +377,17 @@ def _assign(lv: LValue, value: Any, env: Env) -> None:
         return
     if isinstance(lv, IndexLValue):
         obj = evaluate(lv.obj, env)
-        index = evaluate(lv.index, env)
+        indices = [evaluate(i, env) for i in lv.indices]
+        if isinstance(obj, MatrixValue):
+            obj.data[_matrix_offset(obj, indices)] = value
+            return
+        if len(indices) != 1:
+            raise RunError(
+                f"multi-index assignment requires a matrix, got {type(obj).__name__}"
+            )
+        index = indices[0]
         if isinstance(obj, list):
-            i = int(index) - 1
+            i = int(index)
             if i < 0 or i >= len(obj):
                 raise RunError(f"list index {index} out of range (length {len(obj)})")
             obj[i] = value
@@ -321,7 +405,7 @@ def _lvalue_get(lv: LValue, env: Env) -> Any:
     if isinstance(lv, FieldLValue):
         return evaluate(FieldAccess(lv.obj, lv.field), env)
     if isinstance(lv, IndexLValue):
-        return evaluate(IndexAccess(lv.obj, lv.index), env)
+        return evaluate(IndexAccess(lv.obj, lv.indices), env)
     raise RunError(f"unknown lvalue: {lv!r}")
 
 

@@ -178,7 +178,7 @@ repeat n times
 end
 
 repeat for i from 1 to n
-    repeat for j from 1 to n minus i
+    repeat for j from 0 to n minus i minus 1
         if arr[j] is greater than arr[j plus 1]
             set tmp to arr[j]
             set arr[j] to arr[j plus 1]
@@ -187,7 +187,7 @@ repeat for i from 1 to n
     end
 end
 
-print arr[1] and arr[n]
+print arr[0] and arr[n minus 1]
 """
 
 BUBBLE_PYTHON = f"""
@@ -224,10 +224,12 @@ SIEVE_N = 10_000
 
 SIEVE_PLAIN = f"""
 set n to {SIEVE_N}
+# is_prime has length n+1; index k represents the number k
 set is_prime to empty list of number
-repeat n times
+repeat n plus 1 times
     append 1 to is_prime
 end
+set is_prime[0] to 0
 set is_prime[1] to 0
 
 set i to 2
@@ -243,7 +245,7 @@ repeat while i times i is at most n
 end
 
 set count to 0
-repeat for k from 1 to n
+repeat for k from 2 to n
     if is_prime[k] is equal to 1
         add 1 to count
     end
