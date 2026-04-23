@@ -1,0 +1,1 @@
+1. when initialise matrix of records, it create different matrices with all fields

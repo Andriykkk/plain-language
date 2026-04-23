@@ -485,6 +485,244 @@ print call x
             run_capture(src)
 
 
+class TestRecords(unittest.TestCase):
+    def test_define_and_set_fields(self):
+        src = """define record Person
+    name as text
+    age as number
+end
+
+set u to new Person
+set u.name to "Alice"
+set u.age to 30
+print u.name and u.age
+"""
+        self.assertEqual(run_capture(src), "Alice 30\n")
+
+    def test_default_field_values(self):
+        # number defaults to 0, text to "", list to [], map to {}
+        src = """define record Box
+    count as number
+    label as text
+    items as list of number
+end
+
+set b to new Box
+print b.count
+print b.label is equal to ""
+print length of b.items
+"""
+        self.assertEqual(run_capture(src), "0\nTrue\n0\n")
+
+    def test_add_to_field(self):
+        src = """define record Account
+    balance as number
+end
+
+set a to new Account
+set a.balance to 50
+add 25 to a.balance
+print a.balance
+"""
+        self.assertEqual(run_capture(src), "75\n")
+
+    def test_multiply_field(self):
+        src = """define record Rect
+    w as number
+    h as number
+end
+
+set r to new Rect
+set r.w to 4
+set r.h to 5
+multiply r.w by r.h
+print r.w
+"""
+        self.assertEqual(run_capture(src), "20\n")
+
+    def test_nested_field_access(self):
+        src = """define record Inner
+    value as number
+end
+
+define record Outer
+    inner as number
+end
+
+set i to new Inner
+set i.value to 42
+set o to new Outer
+set o.inner to i
+print o.inner.value
+"""
+        self.assertEqual(run_capture(src), "42\n")
+
+    def test_end_record_closes_record(self):
+        src = """define record R
+    x as number
+end record
+
+set r to new R
+print r.x
+"""
+        self.assertEqual(run_capture(src), "0\n")
+
+    def test_mismatched_end_if_on_record_errors(self):
+        src = """define record R
+    x as number
+end if
+"""
+        with self.assertRaises(ParseError):
+            run_capture(src)
+
+    def test_field_access_on_non_record_errors(self):
+        with self.assertRaises(RunError):
+            run_capture("set x to 5\nprint x.name\n")
+
+    def test_unknown_field_errors(self):
+        src = """define record P
+    name as text
+end
+
+set p to new P
+print p.missing
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+
+class TestLists(unittest.TestCase):
+    def test_empty_list_and_append(self):
+        src = """set xs to empty list of number
+append 10 to xs
+append 20 to xs
+print length of xs
+print xs[1]
+print xs[2]
+"""
+        self.assertEqual(run_capture(src), "2\n10\n20\n")
+
+    def test_list_is_one_indexed(self):
+        src = """set xs to empty list of number
+append 100 to xs
+append 200 to xs
+append 300 to xs
+print xs[1]
+print xs[3]
+"""
+        self.assertEqual(run_capture(src), "100\n300\n")
+
+    def test_set_list_element(self):
+        src = """set xs to empty list of number
+append 1 to xs
+append 2 to xs
+append 3 to xs
+set xs[2] to 99
+print xs[2]
+"""
+        self.assertEqual(run_capture(src), "99\n")
+
+    def test_add_to_list_element(self):
+        src = """set xs to empty list of number
+append 10 to xs
+append 20 to xs
+add 5 to xs[1]
+print xs[1]
+"""
+        self.assertEqual(run_capture(src), "15\n")
+
+    def test_iterate_list(self):
+        src = """set xs to empty list of number
+append 1 to xs
+append 2 to xs
+append 3 to xs
+
+set total to 0
+repeat for each v in xs
+    add v to total
+end
+print total
+"""
+        self.assertEqual(run_capture(src), "6\n")
+
+    def test_index_out_of_range_errors(self):
+        src = """set xs to empty list of number
+append 1 to xs
+print xs[5]
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_append_to_non_list_errors(self):
+        with self.assertRaises(RunError):
+            run_capture("set x to 5\nappend 1 to x\n")
+
+
+class TestMaps(unittest.TestCase):
+    def test_empty_map_and_assign(self):
+        src = """set ages to empty map of text to number
+set ages["Alice"] to 30
+set ages["Bob"] to 25
+print ages["Alice"]
+print ages["Bob"]
+"""
+        self.assertEqual(run_capture(src), "30\n25\n")
+
+    def test_map_length(self):
+        src = """set m to empty map of text to number
+set m["a"] to 1
+set m["b"] to 2
+print length of m
+"""
+        self.assertEqual(run_capture(src), "2\n")
+
+    def test_missing_key_errors(self):
+        src = """set m to empty map of text to number
+print m["missing"]
+"""
+        with self.assertRaises(RunError):
+            run_capture(src)
+
+    def test_add_to_map_value(self):
+        src = """set m to empty map of text to number
+set m["x"] to 10
+add 5 to m["x"]
+print m["x"]
+"""
+        self.assertEqual(run_capture(src), "15\n")
+
+
+class TestListsOfRecords(unittest.TestCase):
+    def test_append_record_and_access_fields(self):
+        src = """define record Item
+    name as text
+    price as number
+end
+
+set items to empty list of Item
+
+set a to new Item
+set a.name to "apple"
+set a.price to 2
+append a to items
+
+set b to new Item
+set b.name to "bread"
+set b.price to 5
+append b to items
+
+print items[1].name
+print items[2].price
+
+set total to 0
+repeat for each it in items
+    add it.price to total
+end
+print total
+"""
+        self.assertEqual(run_capture(src), "apple\n5\n7\n")
+
+
 class TestErrors(unittest.TestCase):
     def test_undefined_variable(self):
         with self.assertRaises(RunError):

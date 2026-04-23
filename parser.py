@@ -4,7 +4,15 @@ from typing import Union
 from lexer import Token, TK
 
 
-# ---------- AST nodes ----------
+# ---------- AST: types ----------
+
+@dataclass
+class TypeRef:
+    name: str
+    inner: list["TypeRef"]
+
+
+# ---------- AST: expressions ----------
 
 @dataclass
 class NumberLit:
@@ -52,42 +60,102 @@ class CallExpr:
 
 
 @dataclass
-class TypeRef:
-    name: str
-    inner: list["TypeRef"]
-
-
-Expr = Union[NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare, CallExpr]
+class FieldAccess:
+    obj: "Expr"
+    field: str
 
 
 @dataclass
+class IndexAccess:
+    obj: "Expr"
+    index: "Expr"
+
+
+@dataclass
+class NewExpr:
+    type_name: str
+
+
+@dataclass
+class EmptyList:
+    elem_type: TypeRef
+
+
+@dataclass
+class EmptyMap:
+    key_type: TypeRef
+    value_type: TypeRef
+
+
+@dataclass
+class LengthExpr:
+    value: "Expr"
+
+
+Expr = Union[
+    NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare, CallExpr,
+    FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap, LengthExpr,
+]
+
+
+# ---------- AST: lvalues (assignment targets) ----------
+
+@dataclass
+class VarLValue:
+    name: str
+
+
+@dataclass
+class FieldLValue:
+    obj: Expr
+    field: str
+
+
+@dataclass
+class IndexLValue:
+    obj: Expr
+    index: Expr
+
+
+LValue = Union[VarLValue, FieldLValue, IndexLValue]
+
+
+# ---------- AST: statements ----------
+
+@dataclass
 class SetStmt:
-    target: str
+    target: LValue
     value: Expr
 
 
 @dataclass
 class AddStmt:
     amount: Expr
-    target: str
+    target: LValue
 
 
 @dataclass
 class SubtractStmt:
     amount: Expr
-    target: str
+    target: LValue
 
 
 @dataclass
 class MultiplyStmt:
-    target: str
+    target: LValue
     factor: Expr
 
 
 @dataclass
 class DivideStmt:
-    target: str
+    target: LValue
     divisor: Expr
+
+
+@dataclass
+class AppendStmt:
+    value: Expr
+    target: LValue
 
 
 @dataclass
@@ -148,6 +216,12 @@ class FunctionDef:
 
 
 @dataclass
+class RecordDef:
+    name: str
+    fields: list[tuple[str, TypeRef]]
+
+
+@dataclass
 class ReturnStmt:
     value: Expr | None
 
@@ -158,10 +232,10 @@ class CallStmt:
 
 
 Stmt = Union[
-    SetStmt, AddStmt, SubtractStmt, MultiplyStmt, DivideStmt, PrintStmt,
-    IfStmt, RepeatTimesStmt, RepeatForEachStmt, RepeatRangeStmt, RepeatWhileStmt,
-    StopStmt, SkipStmt,
-    FunctionDef, ReturnStmt, CallStmt,
+    SetStmt, AddStmt, SubtractStmt, MultiplyStmt, DivideStmt, AppendStmt,
+    PrintStmt, IfStmt, RepeatTimesStmt, RepeatForEachStmt, RepeatRangeStmt,
+    RepeatWhileStmt, StopStmt, SkipStmt,
+    FunctionDef, RecordDef, ReturnStmt, CallStmt,
 ]
 
 
@@ -253,8 +327,6 @@ class Parser:
             self._end_of_statement()
 
     def consume_block_end(self, kind: str, opener: Token) -> None:
-        """Consume 'end' optionally followed by the matching block-kind keyword.
-        Raises a clear error on mismatch (e.g., 'if' closed by 'end repeat')."""
         self.consume(TK.KEYWORD, "end")
         tok = self.peek()
         if tok.kind == TK.KEYWORD:
@@ -290,6 +362,7 @@ class Parser:
             if word == "subtract": return self.parse_subtract()
             if word == "multiply": return self.parse_multiply()
             if word == "divide":   return self.parse_divide()
+            if word == "append":   return self.parse_append()
             if word == "print":    return self.parse_print()
             if word == "if":       return self.parse_if()
             if word == "repeat":   return self.parse_repeat()
@@ -306,38 +379,45 @@ class Parser:
 
     def parse_set(self) -> SetStmt:
         self.consume(TK.KEYWORD, "set")
-        name = self.text(self.consume(TK.IDENT))
+        target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "to")
         value = self.parse_expression()
-        return SetStmt(name, value)
+        return SetStmt(target, value)
 
     def parse_add(self) -> AddStmt:
         self.consume(TK.KEYWORD, "add")
         amount = self.parse_expression()
         self.consume(TK.KEYWORD, "to")
-        target = self.text(self.consume(TK.IDENT))
+        target = self.parse_lvalue()
         return AddStmt(amount, target)
 
     def parse_subtract(self) -> SubtractStmt:
         self.consume(TK.KEYWORD, "subtract")
         amount = self.parse_expression()
         self.consume(TK.KEYWORD, "from")
-        target = self.text(self.consume(TK.IDENT))
+        target = self.parse_lvalue()
         return SubtractStmt(amount, target)
 
     def parse_multiply(self) -> MultiplyStmt:
         self.consume(TK.KEYWORD, "multiply")
-        target = self.text(self.consume(TK.IDENT))
+        target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "by")
         factor = self.parse_expression()
         return MultiplyStmt(target, factor)
 
     def parse_divide(self) -> DivideStmt:
         self.consume(TK.KEYWORD, "divide")
-        target = self.text(self.consume(TK.IDENT))
+        target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "by")
         divisor = self.parse_expression()
         return DivideStmt(target, divisor)
+
+    def parse_append(self) -> AppendStmt:
+        self.consume(TK.KEYWORD, "append")
+        value = self.parse_expression()
+        self.consume(TK.KEYWORD, "to")
+        target = self.parse_lvalue()
+        return AppendStmt(value, target)
 
     def parse_print(self) -> PrintStmt:
         self.consume(TK.KEYWORD, "print")
@@ -397,9 +477,7 @@ class Parser:
             self.consume_block_end("repeat", opener)
             return RepeatRangeStmt(var, start, end_expr, body)
 
-        # In "repeat N times", 'times' is the loop marker, not the multiplication
-        # operator — disable it here so `repeat 10 times` and `repeat 2 plus 3
-        # times` parse correctly. Use parens for multiplication: `repeat (2 times 3) times`.
+        # "repeat N times": 'times' here is the loop marker, not multiplication.
         count = self.parse_addition(allow_times=False)
         self.consume(TK.KEYWORD, "times")
         self._end_of_statement()
@@ -411,9 +489,11 @@ class Parser:
         opener = self.consume(TK.KEYWORD, "define")
         if self.match(TK.KEYWORD, "function"):
             return self.parse_function_def(opener)
+        if self.match(TK.KEYWORD, "record"):
+            return self.parse_record_def(opener)
         tok = self.peek()
         raise ParseError(
-            f"expected 'function' after 'define', got {self.text(tok)!r}", tok
+            f"expected 'function' or 'record' after 'define', got {self.text(tok)!r}", tok
         )
 
     def parse_function_def(self, opener: Token) -> FunctionDef:
@@ -444,6 +524,29 @@ class Parser:
         self.consume_block_end("function", opener)
         return FunctionDef(name, params, return_type, body)
 
+    def parse_record_def(self, opener: Token) -> RecordDef:
+        self.consume(TK.KEYWORD, "record")
+        name = self.text(self.consume(TK.IDENT))
+        self._end_of_statement()
+
+        fields: list[tuple[str, TypeRef]] = []
+        while True:
+            tok = self.peek()
+            if tok.kind == TK.KEYWORD and self.text(tok) == "end":
+                break
+            if tok.kind != TK.IDENT:
+                raise ParseError(
+                    f"expected field name or 'end', got {self.text(tok)!r}", tok
+                )
+            fname = self.text(self.advance())
+            self.consume(TK.KEYWORD, "as")
+            ftype = self.parse_type()
+            fields.append((fname, ftype))
+            self._end_of_statement()
+
+        self.consume_block_end("record", opener)
+        return RecordDef(name, fields)
+
     def parse_type(self) -> TypeRef:
         if self.match(TK.KEYWORD, "list"):
             self.advance()
@@ -461,10 +564,6 @@ class Parser:
         if tok.kind == TK.IDENT:
             self.advance()
             return TypeRef(self.text(tok), [])
-        if tok.kind == TK.KEYWORD:
-            # allow keyword-ish type names that are also keywords in other contexts
-            # (none currently, but leaves room for future 'number'/'text' as keywords)
-            raise ParseError(f"expected type name, got keyword {self.text(tok)!r}", tok)
         raise ParseError(f"expected type name, got {self.text(tok)!r}", tok)
 
     def parse_call(self) -> CallExpr:
@@ -486,6 +585,31 @@ class Parser:
             return ReturnStmt(None)
         value = self.parse_expression()
         return ReturnStmt(value)
+
+    # ---- lvalues ----
+
+    def parse_lvalue(self) -> LValue:
+        name_tok = self.consume(TK.IDENT)
+        current: Expr = VarRef(self.text(name_tok))
+        while True:
+            if self.match(TK.DOT):
+                self.advance()
+                field = self.text(self.consume(TK.IDENT))
+                current = FieldAccess(current, field)
+            elif self.match(TK.LBRACKET):
+                self.advance()
+                index = self.parse_expression()
+                self.consume(TK.RBRACKET)
+                current = IndexAccess(current, index)
+            else:
+                break
+        if isinstance(current, VarRef):
+            return VarLValue(current.name)
+        if isinstance(current, FieldAccess):
+            return FieldLValue(current.obj, current.field)
+        if isinstance(current, IndexAccess):
+            return IndexLValue(current.obj, current.index)
+        raise ParseError("invalid assignment target", name_tok)
 
     # ---- expressions ----
 
@@ -562,21 +686,34 @@ class Parser:
         return left
 
     def parse_primary(self) -> Expr:
+        expr = self._parse_atom()
+        while True:
+            if self.match(TK.DOT):
+                self.advance()
+                field = self.text(self.consume(TK.IDENT))
+                expr = FieldAccess(expr, field)
+            elif self.match(TK.LBRACKET):
+                self.advance()
+                index = self.parse_expression()
+                self.consume(TK.RBRACKET)
+                expr = IndexAccess(expr, index)
+            else:
+                break
+        return expr
+
+    def _parse_atom(self) -> Expr:
         tok = self.peek()
-
-        if tok.kind == TK.NUMBER:
-            self.advance()
-            raw = self.text(tok)
-            return NumberLit(float(raw) if "." in raw else int(raw))
-
-        if tok.kind == TK.STRING:
-            self.advance()
-            return StringLit(decode_string(self.text(tok)))
 
         if tok.kind == TK.KEYWORD:
             word = self.text(tok)
             if word == "call":
                 return self.parse_call()
+            if word == "new":
+                return self.parse_new()
+            if word == "empty":
+                return self.parse_empty()
+            if word == "length":
+                return self.parse_length()
             if word == "true":
                 self.advance()
                 return BoolLit(True)
@@ -586,6 +723,15 @@ class Parser:
             if word == "none":
                 self.advance()
                 return NoneLit()
+
+        if tok.kind == TK.NUMBER:
+            self.advance()
+            raw = self.text(tok)
+            return NumberLit(float(raw) if "." in raw else int(raw))
+
+        if tok.kind == TK.STRING:
+            self.advance()
+            return StringLit(decode_string(self.text(tok)))
 
         if tok.kind == TK.IDENT:
             self.advance()
@@ -598,6 +744,36 @@ class Parser:
             return expr
 
         raise ParseError(f"expected expression, got {self.text(tok)!r}", tok)
+
+    def parse_new(self) -> NewExpr:
+        self.consume(TK.KEYWORD, "new")
+        name = self.text(self.consume(TK.IDENT))
+        return NewExpr(name)
+
+    def parse_empty(self) -> Expr:
+        self.consume(TK.KEYWORD, "empty")
+        if self.match(TK.KEYWORD, "list"):
+            self.advance()
+            self.consume(TK.KEYWORD, "of")
+            elem = self.parse_type()
+            return EmptyList(elem)
+        if self.match(TK.KEYWORD, "map"):
+            self.advance()
+            self.consume(TK.KEYWORD, "of")
+            key = self.parse_type()
+            self.consume(TK.KEYWORD, "to")
+            value = self.parse_type()
+            return EmptyMap(key, value)
+        tok = self.peek()
+        raise ParseError(
+            f"expected 'list' or 'map' after 'empty', got {self.text(tok)!r}", tok
+        )
+
+    def parse_length(self) -> LengthExpr:
+        self.consume(TK.KEYWORD, "length")
+        self.consume(TK.KEYWORD, "of")
+        value = self.parse_primary()
+        return LengthExpr(value)
 
 
 def decode_string(raw: str) -> str:

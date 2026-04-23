@@ -10,37 +10,55 @@ def run(source: str) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''# demo
-define function square
-    input x as number
-    output as number
+    demo = '''# demo — records, lists, maps
 
-    return x times x
-end function
+define record Order
+    customer as text
+    amount as number
+end
 
-define function sum_to
-    input n as number
+define function total_of
+    input orders as list of Order
     output as number
 
     set total to 0
-    repeat for i from 1 to n
-        add i to total
+    repeat for each order in orders
+        add order.amount to total
     end
     return total
 end
 
-define function factorial
-    input n as number
-    output as number
+set orders to empty list of Order
 
-    if n is at most 1
-        return 1
-    end
-    return n times call factorial with (n minus 1)
+set o1 to new Order
+set o1.customer to "Alice"
+set o1.amount to 100
+append o1 to orders
+
+set o2 to new Order
+set o2.customer to "Bob"
+set o2.amount to 250
+append o2 to orders
+
+set o3 to new Order
+set o3.customer to "Carol"
+set o3.amount to 75
+append o3 to orders
+
+set grand_total to call total_of with orders
+print "order count:" and length of orders
+print "grand total:" and grand_total
+
+if grand_total is greater than 300
+    print "big batch"
+else
+    print "small batch"
 end
 
-print "square of 7 is" and call square with 7
-print "sum 1..10 is" and call sum_to with 10
-print "5! is" and call factorial with 5
+set prices_by_item to empty map of text to number
+set prices_by_item["apple"] to 1.5
+set prices_by_item["bread"] to 3.0
+set prices_by_item["milk"] to 2.75
+print "apple costs" and prices_by_item["apple"]
 '''
     run(demo)

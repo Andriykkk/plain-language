@@ -124,6 +124,176 @@ int main(void) {{
 """
 
 
+# ---------- list benchmarks ----------
+
+LIST_BUILD_N = 20_000
+
+LIST_BUILD_PLAIN = f"""
+set xs to empty list of number
+repeat for i from 1 to {LIST_BUILD_N}
+    append i to xs
+end
+set total to 0
+repeat for each v in xs
+    add v to total
+end
+print total
+"""
+
+LIST_BUILD_PYTHON = f"""
+xs = []
+for i in range(1, {LIST_BUILD_N} + 1):
+    xs.append(i)
+total = 0
+for v in xs:
+    total += v
+print(total)
+"""
+
+LIST_BUILD_C = f"""#include <stdio.h>
+#include <stdlib.h>
+int main(void) {{
+    int n = {LIST_BUILD_N};
+    long long *xs = (long long*)malloc(sizeof(long long) * n);
+    for (int i = 0; i < n; i++) xs[i] = i + 1;
+    long long total = 0;
+    for (int i = 0; i < n; i++) total += xs[i];
+    printf("%lld\\n", total);
+    free(xs);
+    return 0;
+}}
+"""
+
+
+BUBBLE_N = 200
+
+BUBBLE_PLAIN = f"""
+set n to {BUBBLE_N}
+set arr to empty list of number
+
+set v to n
+repeat n times
+    append v to arr
+    subtract 1 from v
+end
+
+repeat for i from 1 to n
+    repeat for j from 1 to n minus i
+        if arr[j] is greater than arr[j plus 1]
+            set tmp to arr[j]
+            set arr[j] to arr[j plus 1]
+            set arr[j plus 1] to tmp
+        end
+    end
+end
+
+print arr[1] and arr[n]
+"""
+
+BUBBLE_PYTHON = f"""
+n = {BUBBLE_N}
+arr = list(range(n, 0, -1))
+for i in range(1, n + 1):
+    for j in range(0, n - i):
+        if arr[j] > arr[j + 1]:
+            arr[j], arr[j + 1] = arr[j + 1], arr[j]
+print(arr[0], arr[-1])
+"""
+
+BUBBLE_C = f"""#include <stdio.h>
+int main(void) {{
+    int n = {BUBBLE_N};
+    int arr[{BUBBLE_N}];
+    for (int i = 0; i < n; i++) arr[i] = n - i;
+    for (int i = 1; i <= n; i++) {{
+        for (int j = 0; j < n - i; j++) {{
+            if (arr[j] > arr[j + 1]) {{
+                int t = arr[j];
+                arr[j] = arr[j + 1];
+                arr[j + 1] = t;
+            }}
+        }}
+    }}
+    printf("%d %d\\n", arr[0], arr[n - 1]);
+    return 0;
+}}
+"""
+
+
+SIEVE_N = 10_000
+
+SIEVE_PLAIN = f"""
+set n to {SIEVE_N}
+set is_prime to empty list of number
+repeat n times
+    append 1 to is_prime
+end
+set is_prime[1] to 0
+
+set i to 2
+repeat while i times i is at most n
+    if is_prime[i] is equal to 1
+        set j to i times i
+        repeat while j is at most n
+            set is_prime[j] to 0
+            add i to j
+        end
+    end
+    add 1 to i
+end
+
+set count to 0
+repeat for k from 1 to n
+    if is_prime[k] is equal to 1
+        add 1 to count
+    end
+end
+
+print count
+"""
+
+SIEVE_PYTHON = f"""
+n = {SIEVE_N}
+is_prime = [1] * (n + 1)
+is_prime[0] = 0
+is_prime[1] = 0
+i = 2
+while i * i <= n:
+    if is_prime[i]:
+        j = i * i
+        while j <= n:
+            is_prime[j] = 0
+            j += i
+    i += 1
+count = 0
+for k in range(n + 1):
+    if is_prime[k]:
+        count += 1
+print(count)
+"""
+
+SIEVE_C = f"""#include <stdio.h>
+int main(void) {{
+    int n = {SIEVE_N};
+    int is_prime[{SIEVE_N} + 1];
+    for (int i = 0; i <= n; i++) is_prime[i] = 1;
+    is_prime[0] = 0;
+    is_prime[1] = 0;
+    for (int i = 2; i * i <= n; i++) {{
+        if (is_prime[i]) {{
+            for (int j = i * i; j <= n; j += i) {{
+                is_prime[j] = 0;
+            }}
+        }}
+    }}
+    int count = 0;
+    for (int k = 0; k <= n; k++) if (is_prime[k]) count++;
+    printf("%d\\n", count);
+    return 0;
+}}
+"""
+
+
 # ---------- runner ----------
 
 def _fmt_ms(t: float | None) -> str:
@@ -174,6 +344,9 @@ def main() -> None:
     print(f"PlainLang vs Python vs C — single run, no warmup")
     compare(f"Sum loop 1..{LOOP_N}", LOOP_PLAIN, LOOP_PYTHON, LOOP_C)
     compare(f"Recursive fibonacci({FIB_N})", FIB_PLAIN, FIB_PYTHON, FIB_C)
+    compare(f"List build + sum ({LIST_BUILD_N} appends)", LIST_BUILD_PLAIN, LIST_BUILD_PYTHON, LIST_BUILD_C)
+    compare(f"Bubble sort (N={BUBBLE_N})", BUBBLE_PLAIN, BUBBLE_PYTHON, BUBBLE_C)
+    compare(f"Sieve of Eratosthenes (N={SIEVE_N})", SIEVE_PLAIN, SIEVE_PYTHON, SIEVE_C)
 
 
 if __name__ == "__main__":
