@@ -23,16 +23,31 @@ class TypeCode(Enum):
     TEXT = auto()
     BOOL = auto()
     NONE = auto()
+    REF = auto()     # pointer to an OS-allocated block (array, map, record, ...)
 
 
 # ---------------------------------------------------------------------------
-# Opcodes. Three kinds of memory traffic (LOAD, STORE, MOVE between regs)
-# plus PRINT and HALT. That's it for this first version.
+# Opcodes.
+#
+# LOAD / STORE     — direct access to main memory (compile-time address).
+# LOAD_AT / STORE_AT  — indirect: read the pointer held in a register, then
+#                       access that OS-allocated block at a runtime offset.
+# ALLOC / APPEND / LEN — lifecycle and simple array ops on heap-allocated
+#                       blocks that live outside the main memory array.
+#
+# PRINT, HALT       — I/O and program end.
 # ---------------------------------------------------------------------------
 
 class Opcode(Enum):
-    LOAD  = auto()    # (r_dst, mem_addr)    — r_dst = memory[addr]
-    STORE = auto()    # (r_src, mem_addr)    — memory[addr] = r_src
+    LOAD  = auto()    # (r_dst, mem_addr)          — r_dst = memory[addr]
+    STORE = auto()    # (r_src, mem_addr)          — memory[addr] = r_src
+
+    ALLOC    = auto()  # (r_dst, size_imm)          — r_dst = new array of given size
+    LOAD_AT  = auto()  # (r_dst, r_ptr, r_off)      — r_dst = (*r_ptr)[r_off]
+    STORE_AT = auto()  # (r_src, r_ptr, r_off)      — (*r_ptr)[r_off] = r_src
+    APPEND   = auto()  # (r_ptr, r_val)             — (*r_ptr).append(r_val)
+    LEN      = auto()  # (r_dst, r_ptr)             — r_dst = len(*r_ptr)
+
     PRINT = auto()    # (r_src,)
     HALT  = auto()    # stop execution
 
@@ -99,5 +114,6 @@ def _guess_type(value: Any) -> str:
     if isinstance(value, int):   return "I64"
     if isinstance(value, float): return "F64"
     if isinstance(value, str):   return "TEXT"
+    if isinstance(value, list):  return "REF"
     if value is None:            return "NONE"
     return "?"

@@ -43,6 +43,32 @@ def execute(module: Module) -> None:
             r_src, addr = operands
             memory[addr] = registers[r_src]
 
+        elif op is Opcode.ALLOC:
+            r_dst, size = operands
+            # OS-managed allocation. In Python this is just a list; in the
+            # eventual C port this would be `calloc(size, sizeof(slot))`.
+            registers[r_dst] = [None] * size
+
+        elif op is Opcode.LOAD_AT:
+            r_dst, r_ptr, r_off = operands
+            block = registers[r_ptr]
+            off = registers[r_off]
+            registers[r_dst] = block[off]
+
+        elif op is Opcode.STORE_AT:
+            r_src, r_ptr, r_off = operands
+            block = registers[r_ptr]
+            off = registers[r_off]
+            block[off] = registers[r_src]
+
+        elif op is Opcode.APPEND:
+            r_ptr, r_val = operands
+            registers[r_ptr].append(registers[r_val])
+
+        elif op is Opcode.LEN:
+            r_dst, r_ptr = operands
+            registers[r_dst] = len(registers[r_ptr])
+
         elif op is Opcode.PRINT:
             (r_src,) = operands
             print(registers[r_src])

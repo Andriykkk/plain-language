@@ -2,25 +2,33 @@
 Compiler — walks the AST and produces one flat bytecode stream + one flat
 memory array.
 
-For each `set x to <literal>`:
-  1. Detect the literal's type (int → I64, float → F64, string → TEXT, etc.)
-  2. Put the literal value into memory at the next free address.
-     (This slot acts as a "constant" — memory pre-filled by the compiler.)
-  3. If the variable `x` is new, pick another memory address for it
-     (uninitialized — just a slot). Otherwise reuse its existing address.
-  4. Emit:  LOAD  r0, <const_addr>    ; r0 = value
-            STORE r0, <var_addr>      ; variable = r0
+For each `set x to <expr>`:
+  1. Decide x's type by compiling <expr>.
+  2. If x is new, pick a memory slot for it. Otherwise reuse its slot.
+  3. Compile <expr> into register r0; emit STORE r0 to x's slot.
+
+For each `set xs[i] to <expr>`:
+  Compile xs into a register (it's a pointer), compile i into another,
+  compile the value into another, then emit STORE_AT.
 
 For each `print <expr>`:
-  1. Compute the expression's address (constant or variable, same thing).
-  2. Emit:  LOAD  r0, <addr>
-            PRINT r0
+  Compile expr into r0, emit PRINT r0.
+
+For each `append <value> to xs`:
+  Compile value into a register, load xs's pointer into another, emit APPEND.
+
+Expressions handled:
+  - literals:      LOADed from a pre-filled memory slot
+  - variable:      LOAD from its slot
+  - empty list:    ALLOC a new (size-0) heap block, return pointer
+  - xs[i]:         LOAD pointer + LOAD index + LOAD_AT
+  - length of xs:  LOAD pointer + LEN
 """
 
 from bytecode import Instruction, Module, Opcode, TypeCode
 from parser import (
-    BoolLit, NoneLit, NumberLit, PrintStmt, SetStmt, Stmt, StringLit,
-    VarLValue, VarRef,
+    AppendStmt, BoolLit, EmptyList, IndexAccess, IndexLValue, LengthExpr,
+    NoneLit, NumberLit, PrintStmt, SetStmt, Stmt, StringLit, VarLValue, VarRef,
 )
 
 
@@ -32,7 +40,7 @@ class Compiler:
     def __init__(self) -> None:
         self.module: Module = Module()
 
-    # ----- entry point -----
+    # ----- entry -----
 
     def compile_program(self, stmts: list[Stmt]) -> Module:
         self.module.entry = 0
@@ -46,31 +54,51 @@ class Compiler:
     def compile_stmt(self, stmt: Stmt) -> None:
         if isinstance(stmt, SetStmt):
             return self.compile_set(stmt)
+        if isinstance(stmt, AppendStmt):
+            return self.compile_append(stmt)
         if isinstance(stmt, PrintStmt):
             return self.compile_print(stmt)
         raise CompileError(f"unsupported statement: {type(stmt).__name__}")
 
     def compile_set(self, stmt: SetStmt) -> None:
-        if not isinstance(stmt.target, VarLValue):
-            raise CompileError("only simple variable targets supported")
-        name = stmt.target.name
+        target = stmt.target
 
-        # Compile the value — put it into register 0, learn its type.
-        value_type = self.compile_expr_into(stmt.value, reg=0)
+        # ----- set xs[i] to value -----
+        if isinstance(target, IndexLValue):
+            # Compile the array pointer, then the index, then the value.
+            # Use distinct registers so they don't clobber each other.
+            self.compile_expr_into(target.obj, reg=1)            # r1 = pointer
+            if len(target.indices) != 1:
+                raise CompileError("only single-index assignment supported")
+            self.compile_expr_into(target.indices[0], reg=2)     # r2 = index
+            self.compile_expr_into(stmt.value, reg=0)            # r0 = value
+            self.emit(Opcode.STORE_AT, (0, 1, 2))
+            return
 
-        # Resolve the variable's memory address (allocate if new).
-        if name in self.module.symbol_table:
-            existing_ty = self.module.symbol_types[name]
-            if existing_ty != value_type:
-                raise CompileError(
-                    f"cannot change type of {name!r} from "
-                    f"{existing_ty.name} to {value_type.name}"
-                )
-            addr = self.module.symbol_table[name]
-        else:
-            addr = self.allocate_variable(name, value_type)
+        # ----- set x to value -----
+        if isinstance(target, VarLValue):
+            value_type = self.compile_expr_into(stmt.value, reg=0)
+            if target.name in self.module.symbol_table:
+                existing = self.module.symbol_types[target.name]
+                if existing != value_type:
+                    raise CompileError(
+                        f"cannot change type of {target.name!r} from "
+                        f"{existing.name} to {value_type.name}"
+                    )
+                addr = self.module.symbol_table[target.name]
+            else:
+                addr = self.allocate_variable(target.name, value_type)
+            self.emit(Opcode.STORE, (0, addr))
+            return
 
-        self.emit(Opcode.STORE, (0, addr))
+        raise CompileError(f"unsupported assignment target: {type(target).__name__}")
+
+    def compile_append(self, stmt: AppendStmt) -> None:
+        # append <value> to <list>
+        # r0 = value, r1 = list pointer; APPEND r1, r0.
+        self.compile_expr_into(stmt.value, reg=0)
+        self.compile_expr_into_lvalue(stmt.target, reg=1)
+        self.emit(Opcode.APPEND, (1, 0))
 
     def compile_print(self, stmt: PrintStmt) -> None:
         for part in stmt.parts:
@@ -78,9 +106,6 @@ class Compiler:
             self.emit(Opcode.PRINT, (0,))
 
     # ----- expressions -----
-    #
-    # compile_expr_into(expr, reg) emits code so that `reg` holds the
-    # expression's value after execution. Returns the expression's type.
 
     def compile_expr_into(self, expr, reg: int) -> TypeCode:
         if isinstance(expr, NumberLit):
@@ -112,12 +137,41 @@ class Compiler:
             self.emit(Opcode.LOAD, (reg, addr))
             return ty
 
+        if isinstance(expr, EmptyList):
+            # A fresh heap-allocated array. Initial size = 0; APPEND grows it.
+            self.emit(Opcode.ALLOC, (reg, 0))
+            return TypeCode.REF
+
+        if isinstance(expr, IndexAccess):
+            if len(expr.indices) != 1:
+                raise CompileError("only single-index access supported")
+            # ptr → reg+1, index → reg+2, then LOAD_AT into reg.
+            self.compile_expr_into(expr.obj, reg + 1)
+            self.compile_expr_into(expr.indices[0], reg + 2)
+            self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
+            # Element type isn't tracked yet — use REF as a generic.
+            return TypeCode.REF
+
+        if isinstance(expr, LengthExpr):
+            self.compile_expr_into(expr.value, reg + 1)
+            self.emit(Opcode.LEN, (reg, reg + 1))
+            return TypeCode.I64
+
         raise CompileError(f"unsupported expression: {type(expr).__name__}")
 
+    def compile_expr_into_lvalue(self, lv, reg: int) -> TypeCode:
+        """Like compile_expr_into but for an assignment target's *current*
+        pointer/value (used by `append <val> to <lvalue>`)."""
+        if isinstance(lv, VarLValue):
+            if lv.name not in self.module.symbol_table:
+                raise CompileError(f"undeclared variable {lv.name!r}")
+            addr = self.module.symbol_table[lv.name]
+            ty = self.module.symbol_types[lv.name]
+            self.emit(Opcode.LOAD, (reg, addr))
+            return ty
+        raise CompileError(f"unsupported append target: {type(lv).__name__}")
+
     # ----- memory layout -----
-    #
-    # Both constants and variables are just slots in `initial_memory`.
-    # The difference is whether we pre-fill the slot or leave it empty.
 
     def allocate_constant(self, value) -> int:
         addr = len(self.module.initial_memory)
@@ -126,7 +180,7 @@ class Compiler:
 
     def allocate_variable(self, name: str, ty: TypeCode) -> int:
         addr = len(self.module.initial_memory)
-        self.module.initial_memory.append(None)   # uninitialized
+        self.module.initial_memory.append(None)
         self.module.symbol_table[name] = addr
         self.module.symbol_types[name] = ty
         return addr

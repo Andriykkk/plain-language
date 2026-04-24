@@ -16,14 +16,20 @@ def run(source: str, show_bytecode: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''set x to 5
-set y to 3.14
-set name to "Alice"
-set ok to true
-
-print x
-print y
+    demo = '''set name to "Alice"
 print name
-print ok
+
+set xs to empty list of integer
+append 10 to xs
+append 20 to xs
+append 30 to xs
+
+print xs[0]
+print xs[1]
+print xs[2]
+print length of xs
+
+set xs[1] to 99
+print xs[1]
 '''
     run(demo, show_bytecode=True)
