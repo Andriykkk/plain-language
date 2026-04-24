@@ -143,6 +143,7 @@ LValue = Union[VarLValue, FieldLValue, IndexLValue]
 class SetStmt:
     target: LValue
     value: Expr
+    annotated_type: "TypeRef | None" = None
 
 
 @dataclass
@@ -399,7 +400,11 @@ class Parser:
         target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "to")
         value = self.parse_expression()
-        return SetStmt(target, value)
+        annotated_type = None
+        if self.match(TK.KEYWORD, "as"):
+            self.advance()
+            annotated_type = self.parse_type()
+        return SetStmt(target, value, annotated_type)
 
     def parse_add(self) -> AddStmt:
         self.consume(TK.KEYWORD, "add")

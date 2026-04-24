@@ -2,39 +2,105 @@
 Compiler — walks the AST and produces one flat bytecode stream + one flat
 memory array.
 
-For each `set x to <expr>`:
-  1. Decide x's type by compiling <expr>.
-  2. If x is new, pick a memory slot for it. Otherwise reuse its slot.
-  3. Compile <expr> into register r0; emit STORE r0 to x's slot.
+Types are tracked at compile time. Each expression compiles into a register
+and returns its TypeCode. When a binary op sees mixed types, the compiler
+emits explicit conversion opcodes to promote the smaller/narrower operand
+to the common result type. Division of two integers produces F64.
 
-For each `set xs[i] to <expr>`:
-  Compile xs into a register (it's a pointer), compile i into another,
-  compile the value into another, then emit STORE_AT.
-
-For each `print <expr>`:
-  Compile expr into r0, emit PRINT r0.
-
-For each `append <value> to xs`:
-  Compile value into a register, load xs's pointer into another, emit APPEND.
-
-Expressions handled:
-  - literals:      LOADed from a pre-filled memory slot
-  - variable:      LOAD from its slot
-  - empty list:    ALLOC a new (size-0) heap block, return pointer
-  - xs[i]:         LOAD pointer + LOAD index + LOAD_AT
-  - length of xs:  LOAD pointer + LEN
+`set x to <expr> as <type>` converts the value to the annotated type.
 """
 
 from bytecode import Instruction, Module, Opcode, TypeCode
 from parser import (
-    AppendStmt, BoolLit, ColumnsExpr, EmptyList, EmptyMatrix, IndexAccess,
-    IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt, RowsExpr, SetStmt,
-    Stmt, StringLit, VarLValue, VarRef,
+    AppendStmt, BinaryOp, BoolLit, ColumnsExpr, EmptyList, EmptyMatrix,
+    IndexAccess, IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt,
+    RowsExpr, SetStmt, Stmt, StringLit, TypeRef, VarLValue, VarRef,
 )
 
 
 class CompileError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Type-system helper tables.
+# ---------------------------------------------------------------------------
+
+# Source-level type names → TypeCode. Aliases ("integer", "number") resolve
+# to the default-width versions.
+PRIMITIVE_TYPES = {
+    "i32":     TypeCode.I32,
+    "i64":     TypeCode.I64,
+    "f32":     TypeCode.F32,
+    "f64":     TypeCode.F64,
+    "integer": TypeCode.I64,
+    "float":   TypeCode.F64,
+    "number":  TypeCode.F64,
+    "bool":    TypeCode.BOOL,
+    "text":    TypeCode.TEXT,
+}
+
+
+NUMERIC_TYPES = {TypeCode.I32, TypeCode.I64, TypeCode.F32, TypeCode.F64}
+
+
+# Promotion table — given two numeric types, what's the common type that
+# covers both? "Covers" means the result can hold any value of either operand
+# without loss in the common case.
+#
+#   I32 + I64       → I64
+#   I32/I64 + F32   → F32 or F64 (we pick F64 when the int is I64 to avoid
+#                                  precision loss on large integers)
+#   F32 + F64       → F64
+_PROMOTE: dict[tuple[TypeCode, TypeCode], TypeCode] = {}
+def _set_promote(a, b, result):
+    _PROMOTE[(a, b)] = result
+    _PROMOTE[(b, a)] = result
+
+for _t in NUMERIC_TYPES:
+    _PROMOTE[(_t, _t)] = _t
+_set_promote(TypeCode.I32, TypeCode.I64, TypeCode.I64)
+_set_promote(TypeCode.F32, TypeCode.F64, TypeCode.F64)
+_set_promote(TypeCode.I32, TypeCode.F32, TypeCode.F32)
+_set_promote(TypeCode.I32, TypeCode.F64, TypeCode.F64)
+_set_promote(TypeCode.I64, TypeCode.F32, TypeCode.F64)   # I64 needs F64 precision
+_set_promote(TypeCode.I64, TypeCode.F64, TypeCode.F64)
+
+
+# Arithmetic opcode per (word, type).
+_ARITH_OPCODES: dict[tuple[str, TypeCode], Opcode] = {
+    ("plus",    TypeCode.I32): Opcode.ADD_I32,
+    ("plus",    TypeCode.I64): Opcode.ADD_I64,
+    ("plus",    TypeCode.F32): Opcode.ADD_F32,
+    ("plus",    TypeCode.F64): Opcode.ADD_F64,
+    ("minus",   TypeCode.I32): Opcode.SUB_I32,
+    ("minus",   TypeCode.I64): Opcode.SUB_I64,
+    ("minus",   TypeCode.F32): Opcode.SUB_F32,
+    ("minus",   TypeCode.F64): Opcode.SUB_F64,
+    ("times",   TypeCode.I32): Opcode.MUL_I32,
+    ("times",   TypeCode.I64): Opcode.MUL_I64,
+    ("times",   TypeCode.F32): Opcode.MUL_F32,
+    ("times",   TypeCode.F64): Opcode.MUL_F64,
+    ("divided", TypeCode.F32): Opcode.DIV_F32,
+    ("divided", TypeCode.F64): Opcode.DIV_F64,
+}
+
+
+# Conversion opcode per (from, to).
+_CVT_OPCODES: dict[tuple[TypeCode, TypeCode], Opcode] = {
+    (TypeCode.I32, TypeCode.I64): Opcode.CVT_I32_I64,
+    (TypeCode.I64, TypeCode.I32): Opcode.CVT_I64_I32,
+    (TypeCode.F32, TypeCode.F64): Opcode.CVT_F32_F64,
+    (TypeCode.F64, TypeCode.F32): Opcode.CVT_F64_F32,
+    (TypeCode.I32, TypeCode.F32): Opcode.CVT_I32_F32,
+    (TypeCode.I32, TypeCode.F64): Opcode.CVT_I32_F64,
+    (TypeCode.I64, TypeCode.F32): Opcode.CVT_I64_F32,
+    (TypeCode.I64, TypeCode.F64): Opcode.CVT_I64_F64,
+    (TypeCode.F32, TypeCode.I32): Opcode.CVT_F32_I32,
+    (TypeCode.F32, TypeCode.I64): Opcode.CVT_F32_I64,
+    (TypeCode.F64, TypeCode.I32): Opcode.CVT_F64_I32,
+    (TypeCode.F64, TypeCode.I64): Opcode.CVT_F64_I64,
+}
 
 
 class Compiler:
@@ -64,8 +130,7 @@ class Compiler:
     def compile_set(self, stmt: SetStmt) -> None:
         target = stmt.target
 
-        # Special case: creating a matrix.
-        # The compiler does the shape bookkeeping — the VM just sees an ALLOC.
+        # Matrix creation — special-cased, no general expression value.
         if isinstance(target, VarLValue) and isinstance(stmt.value, EmptyMatrix):
             return self.compile_set_matrix(target.name, stmt.value)
 
@@ -82,9 +147,17 @@ class Compiler:
                 return self.compile_matrix_set(target, stmt.value)
             raise CompileError("only 1D or 2D indexing supported")
 
-        # ----- set x to value -----
+        # ----- set x to value [as <type>] -----
         if isinstance(target, VarLValue):
             value_type = self.compile_expr_into(stmt.value, reg=0)
+
+            # If the user annotated with `as <type>`, convert to it.
+            if stmt.annotated_type is not None:
+                target_type = self.typeref_to_code(stmt.annotated_type)
+                if value_type != target_type:
+                    self.emit_convert(value_type, target_type, src=0, dst=0)
+                value_type = target_type
+
             if target.name in self.module.symbol_table:
                 existing = self.module.symbol_types[target.name]
                 if existing != value_type:
@@ -100,88 +173,6 @@ class Compiler:
 
         raise CompileError(f"unsupported assignment target: {type(target).__name__}")
 
-    # ----- matrix-specific compile steps -----
-    #
-    # At the VM level a matrix is just a flat array. The compiler knows the
-    # shape, so accesses compile to arithmetic (i*cols + j) + LOAD_AT/STORE_AT.
-
-    def compile_set_matrix(self, name: str, em: EmptyMatrix) -> None:
-        # Shape must be compile-time constants in v1.
-        shape = []
-        for d in em.dims:
-            if not (isinstance(d, NumberLit) and isinstance(d.value, int)):
-                raise CompileError(
-                    "matrix dimensions must be integer literals in v1"
-                )
-            shape.append(d.value)
-        if len(shape) != 2:
-            raise CompileError("only 2D matrices supported in v1")
-
-        total = shape[0] * shape[1]
-
-        # ALLOC — creates a flat block on the OS heap. Size is rows*cols.
-        self.emit(Opcode.ALLOC, (0, total))
-
-        # Declare the variable slot (REF — a pointer), or reuse if it existed.
-        if name in self.module.symbol_table:
-            if self.module.symbol_types[name] != TypeCode.REF:
-                raise CompileError(f"cannot re-type {name!r} as a matrix")
-            addr = self.module.symbol_table[name]
-        else:
-            addr = self.allocate_variable(name, TypeCode.REF)
-
-        # Remember the shape — purely compile-time metadata.
-        self.module.symbol_shapes[name] = tuple(shape)
-
-        self.emit(Opcode.STORE, (0, addr))
-
-    def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
-        shape = self._matrix_shape_of(expr.obj)
-        cols = shape[1]
-
-        r_ptr  = reg + 1
-        r_idx  = reg + 2   # will hold i, then i*cols, then i*cols + j
-        r_cols = reg + 3
-        r_j    = reg + 4
-
-        self.compile_expr_into(expr.obj, r_ptr)             # r_ptr = matrix
-        self.compile_expr_into(expr.indices[0], r_idx)       # r_idx = i
-
-        cols_addr = self.allocate_constant(cols)
-        self.emit(Opcode.LOAD, (r_cols, cols_addr))          # r_cols = cols
-        self.emit(Opcode.MUL,  (r_idx, r_idx, r_cols))       # r_idx = i * cols
-
-        self.compile_expr_into(expr.indices[1], r_j)         # r_j = j
-        self.emit(Opcode.ADD,  (r_idx, r_idx, r_j))          # r_idx = i*cols + j
-
-        self.emit(Opcode.LOAD_AT, (reg, r_ptr, r_idx))
-        return TypeCode.REF  # element type not tracked yet
-
-    def compile_matrix_set(self, target: IndexLValue, value_expr) -> None:
-        shape = self._matrix_shape_of(target.obj)
-        cols = shape[1]
-
-        # Registers: r0 = value, r1 = pointer, r2 = offset, r3 = cols/j scratch
-        self.compile_expr_into(target.obj, reg=1)           # r1 = matrix
-        self.compile_expr_into(target.indices[0], reg=2)     # r2 = i
-
-        cols_addr = self.allocate_constant(cols)
-        self.emit(Opcode.LOAD, (3, cols_addr))               # r3 = cols
-        self.emit(Opcode.MUL,  (2, 2, 3))                    # r2 = i * cols
-
-        self.compile_expr_into(target.indices[1], reg=3)     # r3 = j
-        self.emit(Opcode.ADD,  (2, 2, 3))                    # r2 = i*cols + j
-
-        self.compile_expr_into(value_expr, reg=0)            # r0 = value
-        self.emit(Opcode.STORE_AT, (0, 1, 2))
-
-    def _matrix_shape_of(self, expr) -> tuple[int, ...]:
-        if not isinstance(expr, VarRef):
-            raise CompileError("matrix access requires a direct variable reference")
-        if expr.name not in self.module.symbol_shapes:
-            raise CompileError(f"{expr.name!r} is not a matrix")
-        return self.module.symbol_shapes[expr.name]
-
     def compile_append(self, stmt: AppendStmt) -> None:
         # append <value> to <list>
         # r0 = value, r1 = list pointer; APPEND r1, r0.
@@ -193,6 +184,82 @@ class Compiler:
         for part in stmt.parts:
             self.compile_expr_into(part, reg=0)
             self.emit(Opcode.PRINT, (0,))
+
+    # ----- matrix-specific -----
+
+    def compile_set_matrix(self, name: str, em: EmptyMatrix) -> None:
+        shape = []
+        for d in em.dims:
+            if not (isinstance(d, NumberLit) and isinstance(d.value, int)):
+                raise CompileError(
+                    "matrix dimensions must be integer literals in v1"
+                )
+            shape.append(d.value)
+        if len(shape) != 2:
+            raise CompileError("only 2D matrices supported in v1")
+
+        total = shape[0] * shape[1]
+        self.emit(Opcode.ALLOC, (0, total))
+
+        if name in self.module.symbol_table:
+            if self.module.symbol_types[name] != TypeCode.REF:
+                raise CompileError(f"cannot re-type {name!r} as a matrix")
+            addr = self.module.symbol_table[name]
+        else:
+            addr = self.allocate_variable(name, TypeCode.REF)
+
+        self.module.symbol_shapes[name] = tuple(shape)
+        self.emit(Opcode.STORE, (0, addr))
+
+    def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
+        shape = self._matrix_shape_of(expr.obj)
+        cols = shape[1]
+
+        r_ptr  = reg + 1
+        r_idx  = reg + 2
+        r_cols = reg + 3
+        r_j    = reg + 4
+
+        self.compile_expr_into(expr.obj, r_ptr)
+        i_type = self.compile_expr_into(expr.indices[0], r_idx)
+        self.coerce(i_type, TypeCode.I64, r_idx)
+
+        cols_addr = self.allocate_constant(cols)
+        self.emit(Opcode.LOAD, (r_cols, cols_addr))
+        self.emit(Opcode.MUL_I64, (r_idx, r_idx, r_cols))
+
+        j_type = self.compile_expr_into(expr.indices[1], r_j)
+        self.coerce(j_type, TypeCode.I64, r_j)
+        self.emit(Opcode.ADD_I64, (r_idx, r_idx, r_j))
+
+        self.emit(Opcode.LOAD_AT, (reg, r_ptr, r_idx))
+        return TypeCode.REF   # element type not tracked yet
+
+    def compile_matrix_set(self, target: IndexLValue, value_expr) -> None:
+        shape = self._matrix_shape_of(target.obj)
+        cols = shape[1]
+
+        self.compile_expr_into(target.obj, reg=1)
+        i_type = self.compile_expr_into(target.indices[0], reg=2)
+        self.coerce(i_type, TypeCode.I64, 2)
+
+        cols_addr = self.allocate_constant(cols)
+        self.emit(Opcode.LOAD, (3, cols_addr))
+        self.emit(Opcode.MUL_I64, (2, 2, 3))
+
+        j_type = self.compile_expr_into(target.indices[1], reg=3)
+        self.coerce(j_type, TypeCode.I64, 3)
+        self.emit(Opcode.ADD_I64, (2, 2, 3))
+
+        self.compile_expr_into(value_expr, reg=0)
+        self.emit(Opcode.STORE_AT, (0, 1, 2))
+
+    def _matrix_shape_of(self, expr) -> tuple[int, ...]:
+        if not isinstance(expr, VarRef):
+            raise CompileError("matrix access requires a direct variable reference")
+        if expr.name not in self.module.symbol_shapes:
+            raise CompileError(f"{expr.name!r} is not a matrix")
+        return self.module.symbol_shapes[expr.name]
 
     # ----- expressions -----
 
@@ -226,20 +293,21 @@ class Compiler:
             self.emit(Opcode.LOAD, (reg, addr))
             return ty
 
+        if isinstance(expr, BinaryOp):
+            return self.compile_binop(expr, reg)
+
         if isinstance(expr, EmptyList):
-            # A fresh heap-allocated array. Initial size = 0; APPEND grows it.
             self.emit(Opcode.ALLOC, (reg, 0))
             return TypeCode.REF
 
         if isinstance(expr, IndexAccess):
             if len(expr.indices) == 1:
-                # 1D list access.
                 self.compile_expr_into(expr.obj, reg + 1)
-                self.compile_expr_into(expr.indices[0], reg + 2)
+                idx_type = self.compile_expr_into(expr.indices[0], reg + 2)
+                self.coerce(idx_type, TypeCode.I64, reg + 2)
                 self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
                 return TypeCode.REF
             if len(expr.indices) == 2:
-                # 2D matrix access — offset = i*cols + j.
                 return self.compile_matrix_get(expr, reg)
             raise CompileError("only 1D or 2D indexing supported")
 
@@ -249,7 +317,6 @@ class Compiler:
             return TypeCode.I64
 
         if isinstance(expr, RowsExpr):
-            # `rows of m` — compile-time literal (matrix shape is known).
             shape = self._matrix_shape_of(expr.value)
             addr = self.allocate_constant(shape[0])
             self.emit(Opcode.LOAD, (reg, addr))
@@ -265,9 +332,35 @@ class Compiler:
 
         raise CompileError(f"unsupported expression: {type(expr).__name__}")
 
+    def compile_binop(self, expr: BinaryOp, reg: int) -> TypeCode:
+        """Typed arithmetic. Emits conversions for mixed types, then the
+        typed ADD/SUB/MUL/DIV opcode."""
+        left_reg  = reg + 1
+        right_reg = reg + 2
+
+        left_type  = self.compile_expr_into(expr.left,  left_reg)
+        right_type = self.compile_expr_into(expr.right, right_reg)
+
+        if left_type not in NUMERIC_TYPES or right_type not in NUMERIC_TYPES:
+            raise CompileError(
+                f"arithmetic requires numeric operands, got "
+                f"{left_type.name} and {right_type.name}"
+            )
+
+        # Division rule: always F64. Promote both to F64.
+        if expr.op == "divided":
+            result_type = TypeCode.F64
+        else:
+            result_type = _PROMOTE[(left_type, right_type)]
+
+        self.coerce(left_type,  result_type, left_reg)
+        self.coerce(right_type, result_type, right_reg)
+
+        opcode = _ARITH_OPCODES[(expr.op, result_type)]
+        self.emit(opcode, (reg, left_reg, right_reg))
+        return result_type
+
     def compile_expr_into_lvalue(self, lv, reg: int) -> TypeCode:
-        """Like compile_expr_into but for an assignment target's *current*
-        pointer/value (used by `append <val> to <lvalue>`)."""
         if isinstance(lv, VarLValue):
             if lv.name not in self.module.symbol_table:
                 raise CompileError(f"undeclared variable {lv.name!r}")
@@ -276,6 +369,35 @@ class Compiler:
             self.emit(Opcode.LOAD, (reg, addr))
             return ty
         raise CompileError(f"unsupported append target: {type(lv).__name__}")
+
+    # ----- type helpers -----
+
+    def typeref_to_code(self, type_ref: TypeRef) -> TypeCode:
+        if type_ref.name not in PRIMITIVE_TYPES:
+            raise CompileError(
+                f"unknown type {type_ref.name!r} "
+                f"(expected one of: {', '.join(sorted(PRIMITIVE_TYPES))})"
+            )
+        return PRIMITIVE_TYPES[type_ref.name]
+
+    def coerce(self, from_type: TypeCode, to_type: TypeCode, reg: int) -> None:
+        """Emit a conversion in `reg` if needed. No-op when types match."""
+        if from_type == to_type:
+            return
+        self.emit_convert(from_type, to_type, src=reg, dst=reg)
+
+    def emit_convert(self, from_type: TypeCode, to_type: TypeCode,
+                     src: int, dst: int) -> None:
+        if from_type == to_type:
+            if src != dst:
+                raise CompileError("internal: MOV between regs not yet supported")
+            return
+        op = _CVT_OPCODES.get((from_type, to_type))
+        if op is None:
+            raise CompileError(
+                f"no conversion from {from_type.name} to {to_type.name}"
+            )
+        self.emit(op, (dst, src))
 
     # ----- memory layout -----
 

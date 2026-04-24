@@ -69,13 +69,56 @@ def execute(module: Module) -> None:
             r_dst, r_ptr = operands
             registers[r_dst] = len(registers[r_ptr])
 
-        elif op is Opcode.ADD:
+        # --- typed arithmetic -------------------------------------------------
+        # In Python, all four integer widths and both float widths dispatch
+        # to native arithmetic. The type distinction is a compile-time
+        # contract that becomes real in a C port where these become different
+        # native instructions.
+
+        elif op is Opcode.ADD_I32 or op is Opcode.ADD_I64 \
+             or op is Opcode.ADD_F32 or op is Opcode.ADD_F64:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] + registers[r_b]
 
-        elif op is Opcode.MUL:
+        elif op is Opcode.SUB_I32 or op is Opcode.SUB_I64 \
+             or op is Opcode.SUB_F32 or op is Opcode.SUB_F64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] - registers[r_b]
+
+        elif op is Opcode.MUL_I32 or op is Opcode.MUL_I64 \
+             or op is Opcode.MUL_F32 or op is Opcode.MUL_F64:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] * registers[r_b]
+
+        elif op is Opcode.DIV_F32 or op is Opcode.DIV_F64:
+            r_dst, r_a, r_b = operands
+            b = registers[r_b]
+            if b == 0 or b == 0.0:
+                raise VMError("division by zero")
+            registers[r_dst] = registers[r_a] / b
+
+        # --- typed conversions ------------------------------------------------
+        # Integer-to-integer and float-to-float are no-ops in Python (values
+        # are unbounded ints / native floats). int→float uses float(), and
+        # float→int uses int() (truncation toward zero).
+
+        elif op is Opcode.CVT_I32_I64 or op is Opcode.CVT_I64_I32:
+            r_dst, r_src = operands
+            registers[r_dst] = registers[r_src]
+
+        elif op is Opcode.CVT_F32_F64 or op is Opcode.CVT_F64_F32:
+            r_dst, r_src = operands
+            registers[r_dst] = registers[r_src]
+
+        elif op is Opcode.CVT_I32_F32 or op is Opcode.CVT_I32_F64 \
+             or op is Opcode.CVT_I64_F32 or op is Opcode.CVT_I64_F64:
+            r_dst, r_src = operands
+            registers[r_dst] = float(registers[r_src])
+
+        elif op is Opcode.CVT_F32_I32 or op is Opcode.CVT_F32_I64 \
+             or op is Opcode.CVT_F64_I32 or op is Opcode.CVT_F64_I64:
+            r_dst, r_src = operands
+            registers[r_dst] = int(registers[r_src])
 
         elif op is Opcode.PRINT:
             (r_src,) = operands

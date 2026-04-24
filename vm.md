@@ -1,231 +1,201 @@
-The full flow — bytecode → CPU-like execution
-Here's the complete picture, end to end.
+Design for typed arithmetic — four new types, promotion, explicit conversions
+Before implementing, here's the concrete plan. It adds ~30 opcodes and ~100 lines of compiler logic, but the structure is mechanical.
 
-The four storage areas
-Before anything runs, the VM sets up:
+1. Type system
+Add to TypeCode:
 
-Area	Holds	Lifetime	Access
-Constants pool	literals known at compile time (numbers, strings, record layouts)	program lifetime	LOADK r, k_idx
-Stack	call frames — params, locals, temps of active functions	per call	LOAD.T r, [BP + off] / STORE.T
-Heap	dynamic objects — lists, records, maps, matrices, strings	GC-managed	ALLOC, then LOAD.T / STORE.T via pointer
-Registers	short-lived scratch during computation	per instruction sequence	direct operand
-Constants don't move. Stack grows and shrinks as functions call and return. Heap grows as you allocate. Registers are shared, caller-saved — think of them as the CPU's working memory.
+Code	Size	What
+I32	4 bytes	32-bit signed integer
+I64	8 bytes	64-bit signed integer (current default)
+F32	4 bytes	32-bit float
+F64	8 bytes	64-bit float (current default)
+Keep BOOL, TEXT, NONE, REF as-is.
 
-What the compiler does (analysis phase)
-One walk over the AST produces a complete Module:
+Literal defaults:
+
+5 → I64 (integer literal)
+3.14 → F64 (decimal literal)
+"hello" → TEXT
+true → BOOL
+Source-level type names (recognized in typeref_to_code):
 
 
-Module
-├── functions: {name → Function}
-│   └── each Function knows:
-│       ├── frame_size      (how many bytes of stack per call)
-│       ├── param_layout    (each param's offset from BP)
-│       ├── local_layout    (each local's offset from BP)
-│       ├── instructions    (the bytecode)
-│       └── constants_idx   (references into module's pool)
-├── records: {name → RecordLayout}
-│   └── each RecordLayout knows:
-│       ├── size (total bytes)
-│       └── fields: [(name, type, offset)]
-└── constants: [value, value, ...]    (interned literals)
-Everything static is resolved at compile time: record field offsets, function frame sizes, which slot holds x, which constant index is "hello". The bytecode is then just "memory shuffling with typed ops."
+i32 → I32         f32 → F32
+i64 → I64         f64 → F64
+integer → I64     (default int alias)
+float → F64       (default float alias)
+number → F64      (kept for compat)
+2. Type annotations — parser change
+Extend set to accept an optional as <type> suffix:
 
-Runtime startup
 
-1. VM allocates stack array: stack[1 MB]     — fixed
-2. VM allocates heap:         heap (grows)   — bump allocator or managed
-3. BP = 0, SP = 0
-4. Main function setup: SP += main.frame_size
-5. Begin executing main's first instruction
-The execution loop
+set x to 5              # inferred I64
+set y to 5 as i32       # explicit I32 — value is converted
+set z to 3.14 as f32    # explicit F32
+Parser change (tiny): parse_set optionally consumes as <type>. SetStmt gains an annotated_type: TypeRef | None field. Default None.
 
-while IP < current_function.instructions.count:
-    instr = current_function.instructions[IP]
-    dispatch(instr)   # one of: LOAD, STORE, ADD, JMP, CALL, RET, ALLOC, ...
-    IP += 1
-No tree-walking, no recursion through AST nodes. Just fetch-decode-execute.
+The compiler handles the annotation by inserting a conversion from the inferred value type to the annotated type.
 
-A concrete end-to-end walkthrough
+3. Typed arithmetic opcodes
+Replace the single ADD, MUL with typed variants:
+
+
+ADD_I32  ADD_I64  ADD_F32  ADD_F64
+SUB_I32  SUB_I64  SUB_F32  SUB_F64
+MUL_I32  MUL_I64  MUL_F32  MUL_F64
+DIV_F32  DIV_F64                       ; division → float only
+14 arithmetic opcodes. Each is one line in the VM (Python's native + / - / * / /).
+
+No DIV_I32 / DIV_I64. Integer division always promotes both operands to F64 first, then uses DIV_F64. This matches Python 3's / behavior and the user's stated rule ("integer divided result is float it is ok").
+
+4. Conversion opcodes
+One per ordered pair of distinct numeric types. 4 × 3 = 12 conversions:
+
+
+# int ↔ int
+CVT_I32_I64        CVT_I64_I32
+# float ↔ float
+CVT_F32_F64        CVT_F64_F32
+# int → float
+CVT_I32_F32        CVT_I32_F64
+CVT_I64_F32        CVT_I64_F64
+# float → int
+CVT_F32_I32        CVT_F32_I64
+CVT_F64_I32        CVT_F64_I64
+Each is registers[dst] = int(registers[src]) or float(...) in the Python VM. In a future C port, these become real trunc, sext, fptosi, sitofp LLVM instructions.
+
+5. Promotion rules
+When ADD sees two different-typed operands, the compiler promotes to the "smallest common type that covers both":
+
+Left	Right	Result
+I32	I32	I32
+I64	I64	I64
+I32	I64	I64 (widen I32)
+F32	F32	F32
+F64	F64	F64
+F32	F64	F64 (widen F32)
+I32	F32	F32
+I32	F64	F64
+I64	F32	F64 (F32 can't represent all I64 exactly — upgrade to F64)
+I64	F64	F64
+Order doesn't matter (promote is commutative). For DIV override: result is always F64, promote both operands to F64.
+
+6. Compiler changes
+compile_binop (new)
+The current compiler has no arithmetic-expression handling — BinaryOp isn't in compile_expr_into yet. This pass adds it.
+
+
+compile_binop(expr, reg):
+    left_reg, right_reg = reg+1, reg+2
+    left_type  = compile_expr_into(expr.left,  left_reg)
+    right_type = compile_expr_into(expr.right, right_reg)
+
+    if expr.op == "divided":
+        result_type = F64
+    else:
+        result_type = promote(left_type, right_type)
+
+    if left_type  != result_type:
+        emit(CONVERT[left_type → result_type], left_reg, left_reg)
+    if right_type != result_type:
+        emit(CONVERT[right_type → result_type], right_reg, right_reg)
+
+    emit(ARITH_OPCODE[op, result_type], reg, left_reg, right_reg)
+    return result_type
+Type-tracking helpers
+
+promote(a, b) → TypeCode           # table lookup
+arith_opcode(op_word, type) → Opcode    # e.g. ("plus", I32) → ADD_I32
+convert_opcode(from, to) → Opcode       # e.g. (I32, F64) → CVT_I32_F64
+emit_convert(from, to, src, dst)        # uses convert_opcode + emit
+compile_set with annotation
+
+value_type = compile_expr_into(stmt.value, reg=0)
+if stmt.annotated_type is not None:
+    target_type = typeref_to_code(stmt.annotated_type)
+    if value_type != target_type:
+        emit_convert(value_type, target_type, src=0, dst=0)
+    value_type = target_type
+# ...store to slot with type=value_type
+Matrix index math (already uses ADD/MUL)
+Update to use ADD_I64 and MUL_I64 specifically — indices are conceptually I64 in the VM.
+
+7. VM changes
+One dispatch branch per new opcode. Each is a single line:
+
+
+elif op is Opcode.ADD_I64: registers[r_dst] = registers[r_a] + registers[r_b]
+elif op is Opcode.ADD_F64: registers[r_dst] = registers[r_a] + registers[r_b]
+# ...
+elif op is Opcode.CVT_I64_F64: registers[r_dst] = float(registers[r_src])
+elif op is Opcode.CVT_F64_I64: registers[r_dst] = int(registers[r_src])
+In Python, I32 and I64 are the same underlying type — so ADD_I32 and ADD_I64 both do a + b. The type discipline is a compile-time concept here. It becomes real in C where ADD_I32 is a 32-bit add and ADD_I64 is a 64-bit add.
+
+8. What this pass deliberately doesn't do
+No I8, I16. Defer. Same shape when added.
+No unsigned types. Defer.
+No comparison opcodes yet. Typed comparisons (EQ_I64, LT_F64, etc.) follow the same pattern but are independent; adding them now would double the opcode count. Do later.
+No logical ops (and, or, not for bools) — not in source language anyway.
+No overflow checking. I32 ADD_I32 in Python just adds Python ints (unbounded). Real-C behavior would wrap or trap. Defer to C port.
+No constant folding for conversions. The Python VM runs CVT ops even when both operands are literals. A later optimization pass can fold CVT_I64_F64 (const 5) into a literal 5.0 at compile time.
+9. Example — how the compiled output will look
 Source:
 
 
-define record Point
-    x as f64
-    y as f64
-end
+set a to 5              # I64
+set b to 3.14           # F64
+set sum to a + b        # mixed: convert a to F64, then ADD_F64 → F64
+print sum
 
-define function make_point
-    input a as f64
-    input b as f64
-    output as Point
+set x to 10 as i32      # explicit i32
+set y to 3 as i32
+set z to x + y          # both i32, ADD_I32 → I32
+print z
 
-    set p to new Point
-    set p.x to a
-    set p.y to b
-    return p
-end
-
-set pt to call make_point with 3.14 and 2.71
-print pt.x
-After compilation
-
-Module.records:
-  Point: { fields: [(x, F64, off=0), (y, F64, off=8)], size: 16 }
-
-Module.constants: [3.14, 2.71]
-
-Module.functions.make_point:
-  frame_size = 24   (param a at BP+0, param b at BP+8, local p at BP+16)
-  code:
-    ALLOC        r0, 16              ; r0 = heap ptr to new Point (16 bytes)
-    STORE.PTR    r0, [BP+16]          ; p = r0
-    LOAD.F64     r1, [BP+0]           ; r1 = a
-    STORE.F64    r1, r0, #0           ; heap[p + 0] = a
-    LOAD.F64     r1, [BP+8]           ; r1 = b
-    STORE.F64    r1, r0, #8           ; heap[p + 8] = b
-    LOAD.PTR     r0, [BP+16]          ; r0 = p (for return)
-    RET          r0
-
-Module.functions.main:
-  frame_size = 8   (local pt at BP+0)
-  code:
-    LOADK        r0, const_idx(3.14)
-    STORE.F64    r0, [BP+8]            ; arg 0 area (past main's frame)
-    LOADK        r0, const_idx(2.71)
-    STORE.F64    r0, [BP+16]           ; arg 1 area
-    CALL         #make_point, arg_size=16, frame_size=24
-    STORE.PTR    r0, [BP+0]            ; pt = returned pointer
-    LOAD.PTR     r0, [BP+0]            ; reload pt
-    LOAD.F64     r1, r0, #0            ; r1 = pt.x
-    PRINT        r1
-    RETN
-As the program runs
-Startup:
+set w to x / y          # i32 / i32 → F64 (division rule)
+print w
+Expected bytecode shape (compact):
 
 
-stack: [_][_][_][_][_][_][_][_]  (main's frame, 8 bytes, pt uninitialized)
-        ^BP=0                   ^SP=8
-heap:  (empty)
-regs:  []
-Main loads 3.14, 2.71 into arg slots:
+; set a to 5
+LOAD      r0, <#5:I64>
+STORE     r0, <a>                  (a: I64)
 
+; set b to 3.14
+LOAD      r0, <#3.14:F64>
+STORE     r0, <b>                  (b: F64)
 
-stack: [pt=_][arg0=3.14][arg1=2.71][_]...
-        ^BP=0           ^           ^
-                                    SP=24
-CALL make_point transitions:
+; set sum to a + b
+LOAD          r1, <a>              ; I64
+LOAD          r2, <b>              ; F64
+CVT_I64_F64   r1, r1               ; a promoted to F64
+ADD_F64       r0, r1, r2
+STORE         r0, <sum>            (sum: F64)
 
+; set x to 10 as i32
+LOAD          r0, <#10:I64>
+CVT_I64_I32   r0, r0               ; narrow to I32
+STORE         r0, <x>              (x: I32)
 
-(control stack: saved_IP, saved_BP=0 pushed)
-BP is moved to where args are (old SP before CALL).
-New BP = 8, SP = 8 + 24 = 32.
+; set z to x + y
+LOAD          r1, <x>              ; I32
+LOAD          r2, <y>              ; I32
+ADD_I32       r0, r1, r2           ; no conversion needed
+STORE         r0, <z>              (z: I32)
 
-stack: [pt=_][a=3.14][b=2.71][p=_][_]...
-                ^BP=8                   ^SP=32
-a, b, p are all make_point's locals now. They share the same stack array but live at BP+0, BP+8, BP+16 relative to the new BP.
+; set w to x / y  (division → F64)
+LOAD          r1, <x>              ; I32
+LOAD          r2, <y>              ; I32
+CVT_I32_F64   r1, r1
+CVT_I32_F64   r2, r2
+DIV_F64       r0, r1, r2
+STORE         r0, <w>              (w: F64)
+10. Summary of the changes
+File	Adds	Changes
+parser.py	—	parse_set accepts optional as <type>. SetStmt gets annotated_type field.
+bytecode.py	TypeCode.I32, F32. 14 arithmetic opcodes, 12 conversion opcodes.	Remove old ADD, MUL (replaced by typed variants).
+compiler.py	compile_binop, promote, emit_convert, typeref_to_code. Matrix index code uses _I64 variants.	compile_set consults annotated_type. compile_expr_into handles BinaryOp.
+vm.py	Dispatch for 14 + 12 = 26 new opcodes.	—
+Every type has its own opcode at the bytecode level — mechanical to translate to native later. Compiler inserts conversions explicitly; the VM never does implicit coercion.
 
-ALLOC r0, 16 — heap grows:
-
-
-heap:  [____16_bytes____]
-        ^h0
-regs:  r0 = h0   (pointer into heap)
-STORE.PTR r0, [BP+16] — writes the pointer into p:
-
-
-stack: [pt=_][a=3.14][b=2.71][p=h0][_]...
-LOAD.F64 r1, [BP+0] — reads a from stack into register:
-
-
-regs: r0 = h0, r1 = 3.14
-STORE.F64 r1, r0, #0 — writes 3.14 to heap at [p + 0]:
-
-
-heap: [3.14][____8_bytes____]
-       ^h0
-Similar for y, then RET r0 — returns the pointer:
-
-
-(control stack: pop saved_BP → BP=0, saved_IP → IP=after CALL)
-SP = 8  (main's frame restored)
-r0 still holds h0
-Main's STORE.PTR r0, [BP+0] — stores the pointer into pt:
-
-
-stack: [pt=h0][_][_][_]...
-The stack frame for make_point is gone (SP collapsed). But the heap data survives — the pointer (h0) is still in main's pt. The heap is independent of the call stack.
-
-LOAD.F64 r1, r0, #0 — reads heap[pt+0] = 3.14.
-PRINT r1 — outputs 3.14.
-
-What each "store" type does
-Op	Reads from	Writes to	Offset is
-LOAD.T r, [BP+off]	stack	register	immediate
-STORE.T r, [BP+off]	register	stack	immediate
-LOAD.T r, r_base, off	heap (via pointer)	register	immediate offset into struct
-STORE.T r, r_base, off	register	heap (via pointer)	immediate offset into struct
-LOAD.T r, r_base, r_idx	heap (dynamic)	register	from register (for arrays)
-The distinction: stack loads use [BP + offset]. Heap loads use [pointer + offset]. Different mode in the instruction, same mechanism underneath.
-
-Dynamic things — lists, strings, maps
-These live on the heap with an additional runtime header. For a list of i64:
-
-
-heap at list_ptr:
-  [length: i64] [capacity: i64] [data_ptr: ptr]
-                                      │
-                                      ▼
-                                   heap[data_start..]:
-                                     [elem 0: i64][elem 1: i64]...
-append 10 to xs:
-
-
-LOAD.PTR   r0, [BP+off_of_xs]      ; r0 = list header pointer
-APPEND     r0, r_value             ; built-in: grows if needed, writes elem,
-                                    ; increments length
-APPEND is a high-level op that expands into several load/store/compare/alloc sequences. Could be a single opcode in v1 (simpler VM) or lowered to primitives later.
-
-Summary of the flow
-
-Source code
-    │
-    ▼
-Lexer + Parser  →  AST
-    │
-    ▼
-Compiler (full analysis):
-  ├── Pass 1: collect functions and record types
-  ├── Pass 2: assign record-field offsets, compute record sizes
-  ├── Pass 3: for each function, assign stack offsets for params/locals
-  ├── Pass 4: emit typed RISC instructions
-  └── Produce Module { functions, records, constants }
-    │
-    ▼
-VM ready to run
-    │
-    ▼
-Startup:
-  allocate stack (1 MB), empty heap, zero registers
-  set up main's frame: BP=0, SP=main.frame_size
-    │
-    ▼
-Execute loop (fetch-decode-execute):
-  ├── arithmetic       → registers
-  ├── LOAD / STORE      → moves between stack/heap and registers
-  ├── ALLOC             → extends heap, returns pointer to register
-  ├── CALL              → pushes frame, transfers control
-  ├── RET               → pops frame, restores control
-  └── JMP / JMPF / JMPT → within-function control flow
-    │
-    ▼
-Program ends when main RETs
-(unfreed heap memory either lives until exit or is collected by GC)
-Why this is the right model
-Matches real CPU semantics exactly. BP/SP/registers + RAM. Nothing magic.
-Compile-time layout means no runtime offset computation for records — offsets are immediates baked into instructions.
-Heap / stack separation matches how all real systems work. Fast frame allocation (just bump SP), slower but flexible heap for growable things.
-Native codegen is a direct translation. Each bytecode op → 1–3 native instructions. Zero runtime-dispatch cost after AOT.
-Simple to implement. No graph-coloring register allocator in v1 (registers are scratch; compiler uses them naïvely). Layout is greedy per function.
-This is the design. The compiler's job is to lay out everything statically — every offset, every slot, every size — and emit the instruction stream that shuffles values through registers, stack, and heap exactly as a C compiler at -O0 would. The VM's job is to execute that stream as fast as possible, ideally with a tight dispatch loop.
-
-Next step when you're ready: commit to the opcode list for stage 1 (arithmetic + PRINT + RET + stack LOAD/STORE), define the Instruction, Function, Module types, then build the compiler and VM for that subset. The first working program will be set x to 2 + 3; print x — and once that runs end-to-end, extending to everything else is mechanical, not conceptual.
+Want me to implement this? The parser change is ~5 lines, the opcode additions are boilerplate, and the compiler logic is a clean ~80 lines. Total maybe 200 new lines spread across four files

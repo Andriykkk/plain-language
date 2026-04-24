@@ -16,27 +16,32 @@ def run(source: str, show_bytecode: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''# dynamic list — grows with append
-set xs to empty list of integer
-append 10 to xs
-append 20 to xs
-append 30 to xs
-print xs[0]
-print length of xs
+    demo = '''# ---- default types from literals ----
+set a to 5                 # I64 (integer literal)
+set b to 3.14              # F64 (decimal literal)
+set sum to a + b           # mixed: a converted to F64, ADD_F64 → F64
+print sum                  # 8.14
 
-# static 2x3 matrix — one contiguous block, shape known at compile time
-set m to empty matrix 2 by 3 of integer
-set m[0, 0] to 100
-set m[0, 1] to 200
-set m[0, 2] to 300
-set m[1, 0] to 400
-set m[1, 1] to 500
-set m[1, 2] to 600
+# ---- explicit type annotations ----
+set x to 10 as i32         # narrow I64 → I32
+set y to 3 as i32
+set z to x + y             # both I32 → ADD_I32 → I32
+print z                    # 13
 
-print m[0, 1]
-print m[1, 2]
-print rows of m
-print columns of m
-print length of m
+# ---- integer division becomes float ----
+set w to x / y             # I32/I32: both promoted to F64, DIV_F64 → F64
+print w                    # 3.333...
+
+# ---- float widths ----
+set fa to 1.5 as f32
+set fb to 2.5 as f32
+set fsum to fa + fb        # both F32 → ADD_F32 → F32
+print fsum                 # 4.0
+
+# ---- mixing int sizes ----
+set big to 1000000 as i64
+set small to 42 as i32
+set both to big + small    # I32 promoted to I64, ADD_I64 → I64
+print both                 # 1000042
 '''
     run(demo, show_bytecode=True)

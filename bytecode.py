@@ -18,7 +18,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 class TypeCode(Enum):
+    I32 = auto()
     I64 = auto()
+    F32 = auto()
     F64 = auto()
     TEXT = auto()
     BOOL = auto()
@@ -48,10 +50,26 @@ class Opcode(Enum):
     APPEND   = auto()  # (r_ptr, r_val)             — (*r_ptr).append(r_val)
     LEN      = auto()  # (r_dst, r_ptr)             — r_dst = len(*r_ptr)
 
-    # Arithmetic — used by the compiler to compute matrix offsets (i*cols + j)
-    # and later for general expressions.
-    ADD   = auto()    # (r_dst, r_a, r_b)           — r_dst = r_a + r_b
-    MUL   = auto()    # (r_dst, r_a, r_b)           — r_dst = r_a * r_b
+    # Typed arithmetic — each opcode takes (r_dst, r_a, r_b). The compiler
+    # picks the one matching the operand types; it inserts conversions
+    # beforehand when a mixed-type expression needs promotion.
+    # In Python all four int widths and both float widths dispatch to native
+    # arithmetic; the type distinction is purely compile-time here but will
+    # become real machine instructions when this is ported to C.
+    ADD_I32 = auto(); ADD_I64 = auto(); ADD_F32 = auto(); ADD_F64 = auto()
+    SUB_I32 = auto(); SUB_I64 = auto(); SUB_F32 = auto(); SUB_F64 = auto()
+    MUL_I32 = auto(); MUL_I64 = auto(); MUL_F32 = auto(); MUL_F64 = auto()
+    # Division always produces a float — there's no DIV_I32/DIV_I64.
+    # Integer operands get promoted to F64 first.
+    DIV_F32 = auto(); DIV_F64 = auto()
+
+    # Typed conversions — (r_dst, r_src). One per distinct numeric type pair.
+    CVT_I32_I64 = auto(); CVT_I64_I32 = auto()
+    CVT_F32_F64 = auto(); CVT_F64_F32 = auto()
+    CVT_I32_F32 = auto(); CVT_I32_F64 = auto()
+    CVT_I64_F32 = auto(); CVT_I64_F64 = auto()
+    CVT_F32_I32 = auto(); CVT_F32_I64 = auto()
+    CVT_F64_I32 = auto(); CVT_F64_I64 = auto()
 
     PRINT = auto()    # (r_src,)
     HALT  = auto()    # stop execution
@@ -118,6 +136,8 @@ def dump_module(mod: Module) -> str:
 
 
 def _guess_type(value: Any) -> str:
+    # Best-effort guess — the compiler's type metadata (symbol_types) is the
+    # authoritative source; this is only for dump output on unlabeled cells.
     if isinstance(value, bool):  return "BOOL"
     if isinstance(value, int):   return "I64"
     if isinstance(value, float): return "F64"
