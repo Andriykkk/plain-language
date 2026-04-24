@@ -146,28 +146,10 @@ class SetStmt:
     annotated_type: "TypeRef | None" = None
 
 
-@dataclass
-class AddStmt:
-    amount: Expr
-    target: LValue
-
-
-@dataclass
-class SubtractStmt:
-    amount: Expr
-    target: LValue
-
-
-@dataclass
-class MultiplyStmt:
-    target: LValue
-    factor: Expr
-
-
-@dataclass
-class DivideStmt:
-    target: LValue
-    divisor: Expr
+# AddStmt / SubtractStmt / MultiplyStmt / DivideStmt used to be distinct AST
+# nodes, but they're syntactic sugar for `set target to target <op> amount`.
+# The parser now desugars them into SetStmt + BinaryOp (see _lvalue_to_read_expr
+# below). The compiler only sees the canonical form.
 
 
 @dataclass
@@ -250,11 +232,25 @@ class CallStmt:
 
 
 Stmt = Union[
-    SetStmt, AddStmt, SubtractStmt, MultiplyStmt, DivideStmt, AppendStmt,
+    SetStmt, AppendStmt,
     PrintStmt, IfStmt, RepeatTimesStmt, RepeatForEachStmt, RepeatRangeStmt,
     RepeatWhileStmt, StopStmt, SkipStmt,
     FunctionDef, RecordDef, ReturnStmt, CallStmt,
 ]
+
+
+def _lvalue_to_read_expr(lv: LValue) -> Expr:
+    """Mirror an assignment target into the corresponding read-side
+    expression. Used when desugaring compound statements like
+    `add N to x` into `set x to x + N`.
+    """
+    if isinstance(lv, VarLValue):
+        return VarRef(lv.name)
+    if isinstance(lv, FieldLValue):
+        return FieldAccess(lv.obj, lv.field)
+    if isinstance(lv, IndexLValue):
+        return IndexAccess(lv.obj, lv.indices)
+    raise AssertionError(f"unknown lvalue: {type(lv).__name__}")
 
 
 BLOCK_KINDS = {"if", "repeat", "function", "record"}
@@ -406,33 +402,46 @@ class Parser:
             annotated_type = self.parse_type()
         return SetStmt(target, value, annotated_type)
 
-    def parse_add(self) -> AddStmt:
+    # ----- compound statements — desugared into SetStmt + BinaryOp -----
+    #
+    # `add N to x`       →  set x to x + N
+    # `subtract N from x`→  set x to x - N
+    # `multiply x by N`  →  set x to x * N
+    # `divide x by N`    →  set x to x / N
+    #
+    # The compiler only sees SetStmt — these four are pure sugar.
+
+    def parse_add(self) -> SetStmt:
         self.consume(TK.KEYWORD, "add")
         amount = self.parse_expression()
         self.consume(TK.KEYWORD, "to")
         target = self.parse_lvalue()
-        return AddStmt(amount, target)
+        read = _lvalue_to_read_expr(target)
+        return SetStmt(target, BinaryOp("plus", read, amount))
 
-    def parse_subtract(self) -> SubtractStmt:
+    def parse_subtract(self) -> SetStmt:
         self.consume(TK.KEYWORD, "subtract")
         amount = self.parse_expression()
         self.consume(TK.KEYWORD, "from")
         target = self.parse_lvalue()
-        return SubtractStmt(amount, target)
+        read = _lvalue_to_read_expr(target)
+        return SetStmt(target, BinaryOp("minus", read, amount))
 
-    def parse_multiply(self) -> MultiplyStmt:
+    def parse_multiply(self) -> SetStmt:
         self.consume(TK.KEYWORD, "multiply")
         target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "by")
         factor = self.parse_expression()
-        return MultiplyStmt(target, factor)
+        read = _lvalue_to_read_expr(target)
+        return SetStmt(target, BinaryOp("times", read, factor))
 
-    def parse_divide(self) -> DivideStmt:
+    def parse_divide(self) -> SetStmt:
         self.consume(TK.KEYWORD, "divide")
         target = self.parse_lvalue()
         self.consume(TK.KEYWORD, "by")
         divisor = self.parse_expression()
-        return DivideStmt(target, divisor)
+        read = _lvalue_to_read_expr(target)
+        return SetStmt(target, BinaryOp("divided", read, divisor))
 
     def parse_append(self) -> AppendStmt:
         self.consume(TK.KEYWORD, "append")

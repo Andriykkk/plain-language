@@ -209,11 +209,20 @@ class Compiler:
 
             if target.name in self.module.symbol_table:
                 existing = self.module.symbol_types[target.name]
+                # Variable keeps its declared type on reassignment.
+                # Silent coercion when the RHS is numeric — enables the
+                # desugared compound form `divide x by 4` (becomes
+                # `set x to x / 4`) to work for integer x: the RHS is F64
+                # from the division rule, then narrowed back to I64 here.
                 if existing != value_type:
-                    raise CompileError(
-                        f"cannot change type of {target.name!r} from "
-                        f"{existing.name} to {value_type.name}"
-                    )
+                    if existing in NUMERIC_TYPES and value_type in NUMERIC_TYPES:
+                        self.emit_convert(value_type, existing, src=0, dst=0)
+                        value_type = existing
+                    else:
+                        raise CompileError(
+                            f"cannot change type of {target.name!r} from "
+                            f"{existing.name} to {value_type.name}"
+                        )
                 addr = self.module.symbol_table[target.name]
             else:
                 addr = self.allocate_variable(target.name, value_type)
