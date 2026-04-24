@@ -2,9 +2,16 @@ import io
 import unittest
 from contextlib import redirect_stdout
 
-from evaluator import RunError
+# The evaluator is gone — `run()` now goes through the bytecode path.
+# Tests catch whichever of the three error types the new pipeline raises.
+from compiler import CompileError
 from parser import ParseError
+from vm import VMError
 from run import run
+
+# Backwards-compatible name: tests that used to catch RunError now catch
+# either a compile-time or a runtime error from the bytecode pipeline.
+RunError = (CompileError, VMError)
 
 
 def run_capture(source: str) -> str:

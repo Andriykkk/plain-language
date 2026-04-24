@@ -16,3 +16,14 @@ No comparison opcodes yet (EQ_I64, LT_F64, etc.). Same structure; add with the i
 Dump shows literal types as "I64"/"F64" for unlabeled cells. The compiler's actual symbol_types is authoritative for variables (and correct); the _guess_type fallback only applies to anonymous constants.
 Constants aren't deduplicated. Same literal appearing twice allocates twice. Easy optimization for later.
 Matrix element types aren't tracked — reading m[i, j] still returns REF (opaque). Will matter when arithmetic on matrix cells needs specific-typed opcodes; straightforward extension of symbol_shapes to carry element type too
+
+
+[ ]
+Compound assignments (add N to x, subtract, multiply, divide)	No handler for AddStmt etc.	~15 tests
+All repeat loop forms (N times, for i from X to Y, while, for each)	No loop compiler	~15 tests
+stop / skip	Same (needs loop context stack)	2 tests
+Functions (define function, call, return)	No function compiler	~10 tests
+Maps beyond basics	empty map / indexed ops partial	3 tests
+Record default field values / end record style closer / nested field access	Partial	~5 tests
+3D+ matrices	Only 2D supported	1 test
+print a and b joining with space	compile_print emits one PRINT per part, each adds newline	2 tests
