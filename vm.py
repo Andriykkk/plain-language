@@ -69,6 +69,14 @@ def execute(module: Module) -> None:
             r_dst, r_ptr = operands
             registers[r_dst] = len(registers[r_ptr])
 
+        elif op is Opcode.ADD:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] + registers[r_b]
+
+        elif op is Opcode.MUL:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] * registers[r_b]
+
         elif op is Opcode.PRINT:
             (r_src,) = operands
             print(registers[r_src])

@@ -27,8 +27,9 @@ Expressions handled:
 
 from bytecode import Instruction, Module, Opcode, TypeCode
 from parser import (
-    AppendStmt, BoolLit, EmptyList, IndexAccess, IndexLValue, LengthExpr,
-    NoneLit, NumberLit, PrintStmt, SetStmt, Stmt, StringLit, VarLValue, VarRef,
+    AppendStmt, BoolLit, ColumnsExpr, EmptyList, EmptyMatrix, IndexAccess,
+    IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt, RowsExpr, SetStmt,
+    Stmt, StringLit, VarLValue, VarRef,
 )
 
 
@@ -63,17 +64,23 @@ class Compiler:
     def compile_set(self, stmt: SetStmt) -> None:
         target = stmt.target
 
-        # ----- set xs[i] to value -----
+        # Special case: creating a matrix.
+        # The compiler does the shape bookkeeping — the VM just sees an ALLOC.
+        if isinstance(target, VarLValue) and isinstance(stmt.value, EmptyMatrix):
+            return self.compile_set_matrix(target.name, stmt.value)
+
+        # ----- set xs[i] to value  (1D)  -----
+        # ----- set m[i, j] to value (2D matrix) -----
         if isinstance(target, IndexLValue):
-            # Compile the array pointer, then the index, then the value.
-            # Use distinct registers so they don't clobber each other.
-            self.compile_expr_into(target.obj, reg=1)            # r1 = pointer
-            if len(target.indices) != 1:
-                raise CompileError("only single-index assignment supported")
-            self.compile_expr_into(target.indices[0], reg=2)     # r2 = index
-            self.compile_expr_into(stmt.value, reg=0)            # r0 = value
-            self.emit(Opcode.STORE_AT, (0, 1, 2))
-            return
+            if len(target.indices) == 1:
+                self.compile_expr_into(target.obj, reg=1)         # r1 = pointer
+                self.compile_expr_into(target.indices[0], reg=2)   # r2 = index
+                self.compile_expr_into(stmt.value, reg=0)          # r0 = value
+                self.emit(Opcode.STORE_AT, (0, 1, 2))
+                return
+            if len(target.indices) == 2:
+                return self.compile_matrix_set(target, stmt.value)
+            raise CompileError("only 1D or 2D indexing supported")
 
         # ----- set x to value -----
         if isinstance(target, VarLValue):
@@ -92,6 +99,88 @@ class Compiler:
             return
 
         raise CompileError(f"unsupported assignment target: {type(target).__name__}")
+
+    # ----- matrix-specific compile steps -----
+    #
+    # At the VM level a matrix is just a flat array. The compiler knows the
+    # shape, so accesses compile to arithmetic (i*cols + j) + LOAD_AT/STORE_AT.
+
+    def compile_set_matrix(self, name: str, em: EmptyMatrix) -> None:
+        # Shape must be compile-time constants in v1.
+        shape = []
+        for d in em.dims:
+            if not (isinstance(d, NumberLit) and isinstance(d.value, int)):
+                raise CompileError(
+                    "matrix dimensions must be integer literals in v1"
+                )
+            shape.append(d.value)
+        if len(shape) != 2:
+            raise CompileError("only 2D matrices supported in v1")
+
+        total = shape[0] * shape[1]
+
+        # ALLOC — creates a flat block on the OS heap. Size is rows*cols.
+        self.emit(Opcode.ALLOC, (0, total))
+
+        # Declare the variable slot (REF — a pointer), or reuse if it existed.
+        if name in self.module.symbol_table:
+            if self.module.symbol_types[name] != TypeCode.REF:
+                raise CompileError(f"cannot re-type {name!r} as a matrix")
+            addr = self.module.symbol_table[name]
+        else:
+            addr = self.allocate_variable(name, TypeCode.REF)
+
+        # Remember the shape — purely compile-time metadata.
+        self.module.symbol_shapes[name] = tuple(shape)
+
+        self.emit(Opcode.STORE, (0, addr))
+
+    def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
+        shape = self._matrix_shape_of(expr.obj)
+        cols = shape[1]
+
+        r_ptr  = reg + 1
+        r_idx  = reg + 2   # will hold i, then i*cols, then i*cols + j
+        r_cols = reg + 3
+        r_j    = reg + 4
+
+        self.compile_expr_into(expr.obj, r_ptr)             # r_ptr = matrix
+        self.compile_expr_into(expr.indices[0], r_idx)       # r_idx = i
+
+        cols_addr = self.allocate_constant(cols)
+        self.emit(Opcode.LOAD, (r_cols, cols_addr))          # r_cols = cols
+        self.emit(Opcode.MUL,  (r_idx, r_idx, r_cols))       # r_idx = i * cols
+
+        self.compile_expr_into(expr.indices[1], r_j)         # r_j = j
+        self.emit(Opcode.ADD,  (r_idx, r_idx, r_j))          # r_idx = i*cols + j
+
+        self.emit(Opcode.LOAD_AT, (reg, r_ptr, r_idx))
+        return TypeCode.REF  # element type not tracked yet
+
+    def compile_matrix_set(self, target: IndexLValue, value_expr) -> None:
+        shape = self._matrix_shape_of(target.obj)
+        cols = shape[1]
+
+        # Registers: r0 = value, r1 = pointer, r2 = offset, r3 = cols/j scratch
+        self.compile_expr_into(target.obj, reg=1)           # r1 = matrix
+        self.compile_expr_into(target.indices[0], reg=2)     # r2 = i
+
+        cols_addr = self.allocate_constant(cols)
+        self.emit(Opcode.LOAD, (3, cols_addr))               # r3 = cols
+        self.emit(Opcode.MUL,  (2, 2, 3))                    # r2 = i * cols
+
+        self.compile_expr_into(target.indices[1], reg=3)     # r3 = j
+        self.emit(Opcode.ADD,  (2, 2, 3))                    # r2 = i*cols + j
+
+        self.compile_expr_into(value_expr, reg=0)            # r0 = value
+        self.emit(Opcode.STORE_AT, (0, 1, 2))
+
+    def _matrix_shape_of(self, expr) -> tuple[int, ...]:
+        if not isinstance(expr, VarRef):
+            raise CompileError("matrix access requires a direct variable reference")
+        if expr.name not in self.module.symbol_shapes:
+            raise CompileError(f"{expr.name!r} is not a matrix")
+        return self.module.symbol_shapes[expr.name]
 
     def compile_append(self, stmt: AppendStmt) -> None:
         # append <value> to <list>
@@ -143,18 +232,35 @@ class Compiler:
             return TypeCode.REF
 
         if isinstance(expr, IndexAccess):
-            if len(expr.indices) != 1:
-                raise CompileError("only single-index access supported")
-            # ptr → reg+1, index → reg+2, then LOAD_AT into reg.
-            self.compile_expr_into(expr.obj, reg + 1)
-            self.compile_expr_into(expr.indices[0], reg + 2)
-            self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
-            # Element type isn't tracked yet — use REF as a generic.
-            return TypeCode.REF
+            if len(expr.indices) == 1:
+                # 1D list access.
+                self.compile_expr_into(expr.obj, reg + 1)
+                self.compile_expr_into(expr.indices[0], reg + 2)
+                self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
+                return TypeCode.REF
+            if len(expr.indices) == 2:
+                # 2D matrix access — offset = i*cols + j.
+                return self.compile_matrix_get(expr, reg)
+            raise CompileError("only 1D or 2D indexing supported")
 
         if isinstance(expr, LengthExpr):
             self.compile_expr_into(expr.value, reg + 1)
             self.emit(Opcode.LEN, (reg, reg + 1))
+            return TypeCode.I64
+
+        if isinstance(expr, RowsExpr):
+            # `rows of m` — compile-time literal (matrix shape is known).
+            shape = self._matrix_shape_of(expr.value)
+            addr = self.allocate_constant(shape[0])
+            self.emit(Opcode.LOAD, (reg, addr))
+            return TypeCode.I64
+
+        if isinstance(expr, ColumnsExpr):
+            shape = self._matrix_shape_of(expr.value)
+            if len(shape) < 2:
+                raise CompileError("matrix has no second dimension")
+            addr = self.allocate_constant(shape[1])
+            self.emit(Opcode.LOAD, (reg, addr))
             return TypeCode.I64
 
         raise CompileError(f"unsupported expression: {type(expr).__name__}")

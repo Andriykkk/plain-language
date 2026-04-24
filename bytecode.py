@@ -48,6 +48,11 @@ class Opcode(Enum):
     APPEND   = auto()  # (r_ptr, r_val)             — (*r_ptr).append(r_val)
     LEN      = auto()  # (r_dst, r_ptr)             — r_dst = len(*r_ptr)
 
+    # Arithmetic — used by the compiler to compute matrix offsets (i*cols + j)
+    # and later for general expressions.
+    ADD   = auto()    # (r_dst, r_a, r_b)           — r_dst = r_a + r_b
+    MUL   = auto()    # (r_dst, r_a, r_b)           — r_dst = r_a * r_b
+
     PRINT = auto()    # (r_src,)
     HALT  = auto()    # stop execution
 
@@ -72,9 +77,12 @@ class Module:
     code: list[Instruction] = field(default_factory=list)
     entry: int = 0
     initial_memory: list[Any] = field(default_factory=list)
-    # Debug metadata (not consulted at runtime):
+    # Debug / compile-time metadata (not consulted at runtime):
     symbol_table: dict[str, int] = field(default_factory=dict)   # name → address
     symbol_types: dict[str, TypeCode] = field(default_factory=dict)  # name → type
+    # For matrix variables: the compile-time-known shape (rows, cols, ...).
+    # The VM doesn't know this — matrices are just flat arrays at runtime.
+    symbol_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
