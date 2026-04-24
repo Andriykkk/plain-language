@@ -12,13 +12,13 @@ to the common result type. Division of two integers produces F64.
 
 from dataclasses import dataclass, field
 
-from bytecode import Instruction, Module, Opcode, TypeCode
+from bytecode import Instruction, Module, Opcode, RecordLayout, TypeCode
 from parser import (
     AppendStmt, BinaryOp, BoolLit, ColumnsExpr, Compare, EmptyList, EmptyMatrix,
-    IfStmt, IndexAccess, IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt,
-    RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt,
-    RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt, StringLit, TypeRef, VarLValue,
-    VarRef,
+    FieldAccess, FieldLValue, IfStmt, IndexAccess, IndexLValue, LengthExpr,
+    NewExpr, NoneLit, NumberLit, PrintStmt, RecordDef, RepeatForEachStmt,
+    RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt, RowsExpr, SetStmt,
+    SkipStmt, Stmt, StopStmt, StringLit, TypeRef, VarLValue, VarRef,
 )
 
 
@@ -179,6 +179,8 @@ class Compiler:
     # ----- statements -----
 
     def compile_stmt(self, stmt: Stmt) -> None:
+        if isinstance(stmt, RecordDef):
+            return self.compile_record_def(stmt)
         if isinstance(stmt, SetStmt):
             return self.compile_set(stmt)
         if isinstance(stmt, AppendStmt):
@@ -209,6 +211,15 @@ class Compiler:
         # Matrix creation — special-cased, no general expression value.
         if isinstance(target, VarLValue) and isinstance(stmt.value, EmptyMatrix):
             return self.compile_set_matrix(target.name, stmt.value)
+
+        # Record creation — the compiler remembers which record type the
+        # variable holds so later `p.field` reads know the layout.
+        if isinstance(target, VarLValue) and isinstance(stmt.value, NewExpr):
+            return self.compile_set_new_record(target.name, stmt.value)
+
+        # Field assignment: `set p.field to value`.
+        if isinstance(target, FieldLValue):
+            return self.compile_field_assign(target, stmt.value)
 
         # ----- set xs[i] to value  (1D)  -----
         # ----- set m[i, j] to value (2D matrix) -----
@@ -382,6 +393,146 @@ class Compiler:
 
         self.emit(Opcode.STORE_AT, (0, 1, 2))
 
+    # ----- records -----
+    #
+    # A record is a heap-allocated block of N slots (one slot per field in
+    # declaration order). The variable holds the pointer. Field access is
+    # just LOAD_AT with the field's offset. No vtable, no per-instance type
+    # tag — the compiler tracks each record variable's type statically.
+
+    def compile_record_def(self, stmt: RecordDef) -> None:
+        """Compile-time only: store the record's layout in the module so
+        later field-accesses can look up offsets and types."""
+        fields: list[tuple[str, TypeCode]] = []
+        for field_name, type_ref in stmt.fields:
+            fields.append((field_name, self.typeref_to_elem_code(type_ref)))
+        self.module.records[stmt.name] = RecordLayout(stmt.name, fields)
+
+    def compile_set_new_record(self, name: str, new_expr: NewExpr) -> None:
+        """Allocate a fresh record block, initialize fields to their type
+        defaults, and bind the pointer to `name`."""
+        record_name = new_expr.type_name
+        if record_name not in self.module.records:
+            raise CompileError(f"unknown record type {record_name!r}")
+        layout = self.module.records[record_name]
+        size = len(layout.fields)
+
+        # r0 = new record block (size slots, all initially None from ALLOC)
+        self.emit(Opcode.ALLOC, (0, size))
+
+        # Initialize each field to its type's default value. The VM's ALLOC
+        # zero-fills with None; for non-reference fields we overwrite with
+        # the type's natural zero (0, 0.0, False). For TEXT/REF fields we
+        # allocate a fresh empty array so `length of record.field` returns
+        # 0 instead of erroring on None.
+        for i, (_field_name, field_type) in enumerate(layout.fields):
+            offset_addr = self.allocate_constant(i)
+            self.emit(Opcode.LOAD, (2, offset_addr))
+
+            if field_type == TypeCode.TEXT or field_type == TypeCode.REF:
+                # Fresh empty array for each field — avoids shared state.
+                self.emit(Opcode.ALLOC, (1, 0))
+            else:
+                default = self._default_for_field(field_type)
+                default_addr = self.allocate_constant(default)
+                self.emit(Opcode.LOAD, (1, default_addr))
+
+            self.emit(Opcode.STORE_AT, (1, 0, 2))
+
+        # Bind the record pointer to the variable and remember its type.
+        if name in self.module.symbol_table:
+            if self.module.symbol_types[name] != TypeCode.REF:
+                raise CompileError(f"cannot re-type {name!r} as a record")
+            addr = self.module.symbol_table[name]
+        else:
+            addr = self.allocate_variable(name, TypeCode.REF)
+        self.module.symbol_record_types[name] = record_name
+        self.emit(Opcode.STORE, (0, addr))
+
+    def compile_new_record_inline(self, new_expr: NewExpr, reg: int) -> TypeCode:
+        """`new Person` used inside an expression (not on the right side of
+        `set`). Same ALLOC + default-init, but we can't attach a record
+        type to any variable since there's no target here."""
+        record_name = new_expr.type_name
+        if record_name not in self.module.records:
+            raise CompileError(f"unknown record type {record_name!r}")
+        layout = self.module.records[record_name]
+        size = len(layout.fields)
+
+        self.emit(Opcode.ALLOC, (reg, size))
+        for i, (_field_name, field_type) in enumerate(layout.fields):
+            offset_addr = self.allocate_constant(i)
+            self.emit(Opcode.LOAD, (reg + 2, offset_addr))
+            if field_type == TypeCode.TEXT or field_type == TypeCode.REF:
+                self.emit(Opcode.ALLOC, (reg + 1, 0))
+            else:
+                default = self._default_for_field(field_type)
+                default_addr = self.allocate_constant(default)
+                self.emit(Opcode.LOAD, (reg + 1, default_addr))
+            self.emit(Opcode.STORE_AT, (reg + 1, reg, reg + 2))
+        return TypeCode.REF
+
+    def compile_field_access(self, expr: FieldAccess, reg: int) -> TypeCode:
+        """Read a field: LOAD record pointer, LOAD offset, LOAD_AT."""
+        layout, offset, field_type = self._resolve_field(expr.obj, expr.field)
+        # Load pointer into reg+1
+        self.compile_expr_into(expr.obj, reg + 1)
+        # Load offset constant into reg+2
+        offset_addr = self.allocate_constant(offset)
+        self.emit(Opcode.LOAD, (reg + 2, offset_addr))
+        # Deref: reg = (*ptr)[offset]
+        self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
+        return field_type
+
+    def compile_field_assign(self, target: FieldLValue, value_expr) -> None:
+        """Write a field: compile value, LOAD record pointer, LOAD offset, STORE_AT."""
+        layout, offset, field_type = self._resolve_field(target.obj, target.field)
+
+        # Compile value FIRST into r0 (before setting up r1/r2 — the value
+        # expression may itself use r1+ as scratch).
+        value_type = self.compile_expr_into(value_expr, reg=0)
+
+        # If the value is a single-char string literal and the field is
+        # (conceptually) a character, fold to the code. But we don't track
+        # that distinction for record fields yet; for now allow mismatched
+        # numeric types via coercion and leave non-numeric mismatches as
+        # runtime responsibility.
+        if value_type != field_type \
+           and value_type in NUMERIC_TYPES \
+           and field_type in NUMERIC_TYPES:
+            self.emit_convert(value_type, field_type, src=0, dst=0)
+
+        # Set up pointer and offset, then STORE_AT.
+        self.compile_expr_into(target.obj, reg=1)
+        offset_addr = self.allocate_constant(offset)
+        self.emit(Opcode.LOAD, (2, offset_addr))
+        self.emit(Opcode.STORE_AT, (0, 1, 2))
+
+    def _resolve_field(self, obj_expr, field_name: str) -> tuple[RecordLayout, int, TypeCode]:
+        """Given a record-typed expression and a field name, return the
+        record's layout, the field's offset, and the field's type."""
+        if not isinstance(obj_expr, VarRef):
+            raise CompileError("field access requires a direct variable reference")
+        if obj_expr.name not in self.module.symbol_record_types:
+            raise CompileError(f"{obj_expr.name!r} is not a record")
+        record_name = self.module.symbol_record_types[obj_expr.name]
+        layout = self.module.records[record_name]
+        for i, (fname, ftype) in enumerate(layout.fields):
+            if fname == field_name:
+                return layout, i, ftype
+        raise CompileError(f"record {record_name!r} has no field {field_name!r}")
+
+    def _default_for_field(self, ty: TypeCode) -> object:
+        """Natural zero for a primitive field type (used to default-init
+        a record's fields on creation)."""
+        if ty in (TypeCode.I8, TypeCode.I32, TypeCode.I64):
+            return 0
+        if ty in (TypeCode.F32, TypeCode.F64):
+            return 0.0
+        if ty == TypeCode.BOOL:
+            return False
+        return None   # TEXT/REF handled separately via ALLOC
+
     def _matrix_shape_of(self, expr) -> tuple[int, ...]:
         if not isinstance(expr, VarRef):
             raise CompileError("matrix access requires a direct variable reference")
@@ -455,6 +606,16 @@ class Compiler:
             if len(expr.indices) == 2:
                 return self.compile_matrix_get(expr, reg)
             raise CompileError("only 1D or 2D indexing supported")
+
+        if isinstance(expr, FieldAccess):
+            return self.compile_field_access(expr, reg)
+
+        if isinstance(expr, NewExpr):
+            # Bare `new Person` in an expression context (e.g. inside a
+            # function call argument). Allocates but doesn't record the
+            # record type on any variable — the caller needs to assign it
+            # to a variable for field access to work afterwards.
+            return self.compile_new_record_inline(expr, reg)
 
         if isinstance(expr, LengthExpr):
             self.compile_expr_into(expr.value, reg + 1)

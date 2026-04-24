@@ -117,6 +117,20 @@ class Instruction:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class RecordLayout:
+    """Compile-time layout of a record type. Fields are listed in declaration
+    order; in this slot-based prototype each field takes one slot, so a
+    field's offset is just its index in the list. Will gain explicit byte
+    offsets + alignment when the C port arrives."""
+    name: str
+    fields: list[tuple[str, "TypeCode"]]
+
+    @property
+    def size(self) -> int:
+        return len(self.fields)
+
+
+@dataclass
 class Module:
     code: list[Instruction] = field(default_factory=list)
     entry: int = 0
@@ -131,6 +145,12 @@ class Module:
     # Used so that e.g. `xs[i]` can return its real element type instead of
     # the generic REF the VM sees.
     symbol_elem_types: dict[str, TypeCode] = field(default_factory=dict)
+    # For record variables: the name of the record type. Used to look up
+    # field offsets at field-access time.
+    symbol_record_types: dict[str, str] = field(default_factory=dict)
+    # All record types defined in the program. Populated when the compiler
+    # encounters a `define record <Name>`.
+    records: dict[str, RecordLayout] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
