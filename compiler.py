@@ -29,6 +29,7 @@ class CompileError(Exception):
 # Source-level type names → TypeCode. Aliases ("integer", "number") resolve
 # to the default-width versions.
 PRIMITIVE_TYPES = {
+    "i8":      TypeCode.I8,
     "i32":     TypeCode.I32,
     "i64":     TypeCode.I64,
     "f32":     TypeCode.F32,
@@ -41,7 +42,8 @@ PRIMITIVE_TYPES = {
 }
 
 
-NUMERIC_TYPES = {TypeCode.I32, TypeCode.I64, TypeCode.F32, TypeCode.F64}
+NUMERIC_TYPES = {TypeCode.I8, TypeCode.I32, TypeCode.I64,
+                 TypeCode.F32, TypeCode.F64}
 
 
 # Promotion table — given two numeric types, what's the common type that
@@ -59,8 +61,15 @@ def _set_promote(a, b, result):
 
 for _t in NUMERIC_TYPES:
     _PROMOTE[(_t, _t)] = _t
+# int ↔ int widening — always widen to the larger size.
+_set_promote(TypeCode.I8,  TypeCode.I32, TypeCode.I32)
+_set_promote(TypeCode.I8,  TypeCode.I64, TypeCode.I64)
 _set_promote(TypeCode.I32, TypeCode.I64, TypeCode.I64)
+# float widening.
 _set_promote(TypeCode.F32, TypeCode.F64, TypeCode.F64)
+# int ↔ float — promote the int to the float type (wider float if needed).
+_set_promote(TypeCode.I8,  TypeCode.F32, TypeCode.F32)
+_set_promote(TypeCode.I8,  TypeCode.F64, TypeCode.F64)
 _set_promote(TypeCode.I32, TypeCode.F32, TypeCode.F32)
 _set_promote(TypeCode.I32, TypeCode.F64, TypeCode.F64)
 _set_promote(TypeCode.I64, TypeCode.F32, TypeCode.F64)   # I64 needs F64 precision
@@ -69,14 +78,17 @@ _set_promote(TypeCode.I64, TypeCode.F64, TypeCode.F64)
 
 # Arithmetic opcode per (word, type).
 _ARITH_OPCODES: dict[tuple[str, TypeCode], Opcode] = {
+    ("plus",    TypeCode.I8):  Opcode.ADD_I8,
     ("plus",    TypeCode.I32): Opcode.ADD_I32,
     ("plus",    TypeCode.I64): Opcode.ADD_I64,
     ("plus",    TypeCode.F32): Opcode.ADD_F32,
     ("plus",    TypeCode.F64): Opcode.ADD_F64,
+    ("minus",   TypeCode.I8):  Opcode.SUB_I8,
     ("minus",   TypeCode.I32): Opcode.SUB_I32,
     ("minus",   TypeCode.I64): Opcode.SUB_I64,
     ("minus",   TypeCode.F32): Opcode.SUB_F32,
     ("minus",   TypeCode.F64): Opcode.SUB_F64,
+    ("times",   TypeCode.I8):  Opcode.MUL_I8,
     ("times",   TypeCode.I32): Opcode.MUL_I32,
     ("times",   TypeCode.I64): Opcode.MUL_I64,
     ("times",   TypeCode.F32): Opcode.MUL_F32,
@@ -88,14 +100,26 @@ _ARITH_OPCODES: dict[tuple[str, TypeCode], Opcode] = {
 
 # Conversion opcode per (from, to).
 _CVT_OPCODES: dict[tuple[TypeCode, TypeCode], Opcode] = {
+    # int → int
+    (TypeCode.I8,  TypeCode.I32): Opcode.CVT_I8_I32,
+    (TypeCode.I8,  TypeCode.I64): Opcode.CVT_I8_I64,
+    (TypeCode.I32, TypeCode.I8):  Opcode.CVT_I32_I8,
+    (TypeCode.I64, TypeCode.I8):  Opcode.CVT_I64_I8,
     (TypeCode.I32, TypeCode.I64): Opcode.CVT_I32_I64,
     (TypeCode.I64, TypeCode.I32): Opcode.CVT_I64_I32,
+    # float → float
     (TypeCode.F32, TypeCode.F64): Opcode.CVT_F32_F64,
     (TypeCode.F64, TypeCode.F32): Opcode.CVT_F64_F32,
+    # int → float
+    (TypeCode.I8,  TypeCode.F32): Opcode.CVT_I8_F32,
+    (TypeCode.I8,  TypeCode.F64): Opcode.CVT_I8_F64,
     (TypeCode.I32, TypeCode.F32): Opcode.CVT_I32_F32,
     (TypeCode.I32, TypeCode.F64): Opcode.CVT_I32_F64,
     (TypeCode.I64, TypeCode.F32): Opcode.CVT_I64_F32,
     (TypeCode.I64, TypeCode.F64): Opcode.CVT_I64_F64,
+    # float → int (truncation toward zero)
+    (TypeCode.F32, TypeCode.I8):  Opcode.CVT_F32_I8,
+    (TypeCode.F64, TypeCode.I8):  Opcode.CVT_F64_I8,
     (TypeCode.F32, TypeCode.I32): Opcode.CVT_F32_I32,
     (TypeCode.F32, TypeCode.I64): Opcode.CVT_F32_I64,
     (TypeCode.F64, TypeCode.I32): Opcode.CVT_F64_I32,
@@ -138,9 +162,12 @@ class Compiler:
         # ----- set m[i, j] to value (2D matrix) -----
         if isinstance(target, IndexLValue):
             if len(target.indices) == 1:
+                # Compile value FIRST into r0. If the value expression is
+                # itself indexed (e.g. s[1] = s[4]), it uses r1..r_N as scratch;
+                # doing it before we set up r1/r2 avoids clobbering them.
+                self.compile_char_or_value(target, stmt.value, reg=0)
                 self.compile_expr_into(target.obj, reg=1)         # r1 = pointer
                 self.compile_expr_into(target.indices[0], reg=2)   # r2 = index
-                self.compile_expr_into(stmt.value, reg=0)          # r0 = value
                 self.emit(Opcode.STORE_AT, (0, 1, 2))
                 return
             if len(target.indices) == 2:
@@ -173,6 +200,30 @@ class Compiler:
 
         raise CompileError(f"unsupported assignment target: {type(target).__name__}")
 
+    def compile_char_or_value(self, target: IndexLValue, value_expr,
+                              reg: int) -> None:
+        """Compile the RHS of `set s[i] to <value>`.
+
+        Special case: if s is a TEXT variable and the value is a single-char
+        string literal ("H"), fold the char to its i8 code at compile time.
+        Otherwise compile the value normally — numbers stay numbers,
+        computed values (including s[j] which reads an i8) stay numbers.
+        """
+        if (isinstance(target.obj, VarRef)
+                and self.module.symbol_types.get(target.obj.name) == TypeCode.TEXT
+                and isinstance(value_expr, StringLit)):
+            chars = value_expr.value
+            if len(chars) != 1:
+                raise CompileError(
+                    f"cannot store multi-character string {chars!r} into "
+                    f"a single text slot; use one character"
+                )
+            code = ord(chars[0])
+            addr = self.allocate_constant(code)
+            self.emit(Opcode.LOAD, (reg, addr))
+            return
+        self.compile_expr_into(value_expr, reg=reg)
+
     def compile_append(self, stmt: AppendStmt) -> None:
         # append <value> to <list>
         # r0 = value, r1 = list pointer; APPEND r1, r0.
@@ -182,8 +233,13 @@ class Compiler:
 
     def compile_print(self, stmt: PrintStmt) -> None:
         for part in stmt.parts:
-            self.compile_expr_into(part, reg=0)
-            self.emit(Opcode.PRINT, (0,))
+            ty = self.compile_expr_into(part, reg=0)
+            # TEXT values are arrays of char codes — use PRINT_TEXT to
+            # decode them back. Everything else uses plain PRINT.
+            if ty == TypeCode.TEXT:
+                self.emit(Opcode.PRINT_TEXT, (0,))
+            else:
+                self.emit(Opcode.PRINT, (0,))
 
     # ----- matrix-specific -----
 
@@ -239,6 +295,11 @@ class Compiler:
         shape = self._matrix_shape_of(target.obj)
         cols = shape[1]
 
+        # Compile the value FIRST into r0 (same reason as the 1D case:
+        # if value_expr reads from the matrix itself, its scratch use of
+        # r1..r_N would clobber our setup below).
+        self.compile_expr_into(value_expr, reg=0)
+
         self.compile_expr_into(target.obj, reg=1)
         i_type = self.compile_expr_into(target.indices[0], reg=2)
         self.coerce(i_type, TypeCode.I64, 2)
@@ -251,7 +312,6 @@ class Compiler:
         self.coerce(j_type, TypeCode.I64, 3)
         self.emit(Opcode.ADD_I64, (2, 2, 3))
 
-        self.compile_expr_into(value_expr, reg=0)
         self.emit(Opcode.STORE_AT, (0, 1, 2))
 
     def _matrix_shape_of(self, expr) -> tuple[int, ...]:
@@ -271,7 +331,11 @@ class Compiler:
             return ty
 
         if isinstance(expr, StringLit):
-            addr = self.allocate_constant(expr.value)
+            # Text is an array of character codes. The "string" literal
+            # is pre-populated into memory as a list of ord values; LOAD
+            # gives a pointer to that array.
+            chars = [ord(c) for c in expr.value]
+            addr = self.allocate_constant(chars)
             self.emit(Opcode.LOAD, (reg, addr))
             return TypeCode.TEXT
 

@@ -75,17 +75,17 @@ def execute(module: Module) -> None:
         # contract that becomes real in a C port where these become different
         # native instructions.
 
-        elif op is Opcode.ADD_I32 or op is Opcode.ADD_I64 \
+        elif op is Opcode.ADD_I8 or op is Opcode.ADD_I32 or op is Opcode.ADD_I64 \
              or op is Opcode.ADD_F32 or op is Opcode.ADD_F64:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] + registers[r_b]
 
-        elif op is Opcode.SUB_I32 or op is Opcode.SUB_I64 \
+        elif op is Opcode.SUB_I8 or op is Opcode.SUB_I32 or op is Opcode.SUB_I64 \
              or op is Opcode.SUB_F32 or op is Opcode.SUB_F64:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] - registers[r_b]
 
-        elif op is Opcode.MUL_I32 or op is Opcode.MUL_I64 \
+        elif op is Opcode.MUL_I8 or op is Opcode.MUL_I32 or op is Opcode.MUL_I64 \
              or op is Opcode.MUL_F32 or op is Opcode.MUL_F64:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] * registers[r_b]
@@ -102,7 +102,9 @@ def execute(module: Module) -> None:
         # are unbounded ints / native floats). int→float uses float(), and
         # float→int uses int() (truncation toward zero).
 
-        elif op is Opcode.CVT_I32_I64 or op is Opcode.CVT_I64_I32:
+        elif op is Opcode.CVT_I8_I32  or op is Opcode.CVT_I8_I64  \
+             or op is Opcode.CVT_I32_I8 or op is Opcode.CVT_I64_I8 \
+             or op is Opcode.CVT_I32_I64 or op is Opcode.CVT_I64_I32:
             r_dst, r_src = operands
             registers[r_dst] = registers[r_src]
 
@@ -110,12 +112,14 @@ def execute(module: Module) -> None:
             r_dst, r_src = operands
             registers[r_dst] = registers[r_src]
 
-        elif op is Opcode.CVT_I32_F32 or op is Opcode.CVT_I32_F64 \
+        elif op is Opcode.CVT_I8_F32  or op is Opcode.CVT_I8_F64 \
+             or op is Opcode.CVT_I32_F32 or op is Opcode.CVT_I32_F64 \
              or op is Opcode.CVT_I64_F32 or op is Opcode.CVT_I64_F64:
             r_dst, r_src = operands
             registers[r_dst] = float(registers[r_src])
 
-        elif op is Opcode.CVT_F32_I32 or op is Opcode.CVT_F32_I64 \
+        elif op is Opcode.CVT_F32_I8  or op is Opcode.CVT_F64_I8 \
+             or op is Opcode.CVT_F32_I32 or op is Opcode.CVT_F32_I64 \
              or op is Opcode.CVT_F64_I32 or op is Opcode.CVT_F64_I64:
             r_dst, r_src = operands
             registers[r_dst] = int(registers[r_src])
@@ -123,6 +127,12 @@ def execute(module: Module) -> None:
         elif op is Opcode.PRINT:
             (r_src,) = operands
             print(registers[r_src])
+
+        elif op is Opcode.PRINT_TEXT:
+            (r_src,) = operands
+            # Register holds an array of character codes — decode and print.
+            chars = registers[r_src]
+            print("".join(chr(c) for c in chars))
 
         elif op is Opcode.HALT:
             return

@@ -18,14 +18,19 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 class TypeCode(Enum):
+    I8  = auto()
     I32 = auto()
     I64 = auto()
     F32 = auto()
     F64 = auto()
+    # TEXT is not a runtime concept — it's a compile-time label meaning
+    # "array of I8 intended to be printed as characters." At the VM level,
+    # a TEXT value is an array of I8 just like any other; only PRINT_TEXT
+    # treats it specially.
     TEXT = auto()
     BOOL = auto()
     NONE = auto()
-    REF = auto()     # pointer to an OS-allocated block (array, map, record, ...)
+    REF  = auto()    # pointer to an OS-allocated block (array, map, record, ...)
 
 
 # ---------------------------------------------------------------------------
@@ -56,23 +61,29 @@ class Opcode(Enum):
     # In Python all four int widths and both float widths dispatch to native
     # arithmetic; the type distinction is purely compile-time here but will
     # become real machine instructions when this is ported to C.
-    ADD_I32 = auto(); ADD_I64 = auto(); ADD_F32 = auto(); ADD_F64 = auto()
-    SUB_I32 = auto(); SUB_I64 = auto(); SUB_F32 = auto(); SUB_F64 = auto()
-    MUL_I32 = auto(); MUL_I64 = auto(); MUL_F32 = auto(); MUL_F64 = auto()
-    # Division always produces a float — there's no DIV_I32/DIV_I64.
+    ADD_I8  = auto(); ADD_I32 = auto(); ADD_I64 = auto(); ADD_F32 = auto(); ADD_F64 = auto()
+    SUB_I8  = auto(); SUB_I32 = auto(); SUB_I64 = auto(); SUB_F32 = auto(); SUB_F64 = auto()
+    MUL_I8  = auto(); MUL_I32 = auto(); MUL_I64 = auto(); MUL_F32 = auto(); MUL_F64 = auto()
+    # Division always produces a float — there's no DIV_Ixx.
     # Integer operands get promoted to F64 first.
     DIV_F32 = auto(); DIV_F64 = auto()
 
     # Typed conversions — (r_dst, r_src). One per distinct numeric type pair.
+    CVT_I8_I32  = auto(); CVT_I8_I64  = auto()
+    CVT_I32_I8  = auto(); CVT_I64_I8  = auto()
     CVT_I32_I64 = auto(); CVT_I64_I32 = auto()
     CVT_F32_F64 = auto(); CVT_F64_F32 = auto()
+    CVT_I8_F32  = auto(); CVT_I8_F64  = auto()
     CVT_I32_F32 = auto(); CVT_I32_F64 = auto()
     CVT_I64_F32 = auto(); CVT_I64_F64 = auto()
+    CVT_F32_I8  = auto(); CVT_F64_I8  = auto()
     CVT_F32_I32 = auto(); CVT_F32_I64 = auto()
     CVT_F64_I32 = auto(); CVT_F64_I64 = auto()
 
-    PRINT = auto()    # (r_src,)
-    HALT  = auto()    # stop execution
+    PRINT      = auto()  # (r_src,)           — print the value directly
+    PRINT_TEXT = auto()  # (r_src,)           — register holds a list of character
+                         #                      codes; decode back to a string and print
+    HALT       = auto()
 
 
 @dataclass

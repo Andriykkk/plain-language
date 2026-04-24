@@ -16,32 +16,23 @@ def run(source: str, show_bytecode: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''# ---- default types from literals ----
-set a to 5                 # I64 (integer literal)
-set b to 3.14              # F64 (decimal literal)
-set sum to a + b           # mixed: a converted to F64, ADD_F64 → F64
-print sum                  # 8.14
+    demo = '''set s to "hello"
+print s                    # hello
 
-# ---- explicit type annotations ----
-set x to 10 as i32         # narrow I64 → I32
-set y to 3 as i32
-set z to x + y             # both I32 → ADD_I32 → I32
-print z                    # 13
+# Assigning a single-character string: compiler converts "H" → 72
+set s[0] to "H"
+print s                    # Hello
 
-# ---- integer division becomes float ----
-set w to x / y             # I32/I32: both promoted to F64, DIV_F64 → F64
-print w                    # 3.333...
+# Assigning a number directly: stored as-is (33 = '!')
+set s[4] to 33
+print s                    # Hell!
 
-# ---- float widths ----
-set fa to 1.5 as f32
-set fb to 2.5 as f32
-set fsum to fa + fb        # both F32 → ADD_F32 → F32
-print fsum                 # 4.0
+# Assigning an i8 value from elsewhere (another char in the same text)
+set s[1] to s[4]           # s[1] = 33 ('!')
+print s                    # H!ll!
 
-# ---- mixing int sizes ----
-set big to 1000000 as i64
-set small to 42 as i32
-set both to big + small    # I32 promoted to I64, ADD_I64 → I64
-print both                 # 1000042
+# The individual slots are still just numbers
+print s[0]                 # 72
+print s[1]                 # 33
 '''
-    run(demo, show_bytecode=True)
+    run(demo)
