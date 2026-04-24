@@ -10,12 +10,26 @@ to the common result type. Division of two integers produces F64.
 `set x to <expr> as <type>` converts the value to the annotated type.
 """
 
+from dataclasses import dataclass, field
+
 from bytecode import Instruction, Module, Opcode, TypeCode
 from parser import (
     AppendStmt, BinaryOp, BoolLit, ColumnsExpr, Compare, EmptyList, EmptyMatrix,
     IfStmt, IndexAccess, IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt,
-    RowsExpr, SetStmt, Stmt, StringLit, TypeRef, VarLValue, VarRef,
+    RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt,
+    RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt, StringLit, TypeRef, VarLValue,
+    VarRef,
 )
+
+
+@dataclass
+class LoopContext:
+    """Tracks jumps that exit or continue the nearest enclosing loop.
+    Each `stop` / `skip` statement emits a placeholder JMP and records its
+    instruction index here; `compile_loop` patches them at the right target
+    once the loop's structure is fully emitted."""
+    break_patches: list[int] = field(default_factory=list)
+    continue_patches: list[int] = field(default_factory=list)
 
 
 class CompileError(Exception):
@@ -150,6 +164,8 @@ _CMP_OPCODES[("not_equal", TypeCode.REF)]  = Opcode.NE_REF
 class Compiler:
     def __init__(self) -> None:
         self.module: Module = Module()
+        self.loop_stack: list[LoopContext] = []
+        self._hidden_counter: int = 0
 
     # ----- entry -----
 
@@ -171,6 +187,20 @@ class Compiler:
             return self.compile_print(stmt)
         if isinstance(stmt, IfStmt):
             return self.compile_if(stmt)
+        if isinstance(stmt, RepeatWhileStmt):
+            return self.compile_repeat_while(stmt)
+        if isinstance(stmt, RepeatTimesStmt):
+            return self.compile_repeat_times(stmt)
+        if isinstance(stmt, RepeatRangeStmt):
+            return self.compile_repeat_range(stmt)
+        if isinstance(stmt, RepeatForEachStmt):
+            raise CompileError(
+                "'repeat for each' isn't implemented yet — needs iterator state"
+            )
+        if isinstance(stmt, StopStmt):
+            return self.compile_stop()
+        if isinstance(stmt, SkipStmt):
+            return self.compile_skip()
         raise CompileError(f"unsupported statement: {type(stmt).__name__}")
 
     def compile_set(self, stmt: SetStmt) -> None:
@@ -544,6 +574,147 @@ class Compiler:
 
         # Patch the "skip else" jump to land past the else-body.
         self.patch_jmp_target(jmp_end_idx, self.current_pos())
+
+    # ----- loops -----
+    #
+    # All forms share one shape:
+    #
+    #   [init-code emitted before the loop]
+    #   top:
+    #     [optional condition check → JMPF end]
+    #     <body>                    ← `stop` jumps to end; `skip` jumps to cont
+    #   cont:
+    #     [optional post/increment]
+    #     JMP top
+    #   end:
+    #
+    # compile_loop is the helper. Each `repeat <form>` fills in cond_emit /
+    # post_emit with the form-specific pieces.
+
+    def compile_loop(self, cond_emit, post_emit, body: list[Stmt]) -> None:
+        """Generic while-like loop with an optional post step (for counter
+        increments, etc.). `cond_emit` is called once to emit the condition
+        check; it should put a BOOL into a register and return that register
+        index. Pass None for an infinite loop. `post_emit` is called once to
+        emit code that runs between the body and the condition re-check.
+        """
+        loop_top = self.current_pos()
+
+        jmpf_end_idx: int | None = None
+        if cond_emit is not None:
+            cond_reg = cond_emit()
+            jmpf_end_idx = self.emit_placeholder_jump(Opcode.JMPF, r_cond=cond_reg)
+
+        ctx = LoopContext()
+        self.loop_stack.append(ctx)
+        for s in body:
+            self.compile_stmt(s)
+        self.loop_stack.pop()
+
+        # Continue target — skip lands here; post runs before the re-check.
+        continue_target = self.current_pos()
+        if post_emit is not None:
+            post_emit()
+
+        self.emit(Opcode.JMP, (loop_top,))
+        end_target = self.current_pos()
+
+        if jmpf_end_idx is not None:
+            self.patch_jmp_target(jmpf_end_idx, end_target)
+        for idx in ctx.break_patches:
+            self.patch_jmp_target(idx, end_target)
+        for idx in ctx.continue_patches:
+            self.patch_jmp_target(idx, continue_target)
+
+    def compile_repeat_while(self, stmt: RepeatWhileStmt) -> None:
+        def cond() -> int:
+            cond_type = self.compile_expr_into(stmt.condition, reg=0)
+            if cond_type != TypeCode.BOOL:
+                raise CompileError(
+                    f"while condition must be BOOL, got {cond_type.name}"
+                )
+            return 0
+        self.compile_loop(cond_emit=cond, post_emit=None, body=stmt.body)
+
+    def compile_repeat_times(self, stmt: RepeatTimesStmt) -> None:
+        # Hidden counter + cached count (so a side-effectful count expression
+        # only runs once).
+        counter_addr = self.allocate_variable(self._hidden("c"), TypeCode.I64)
+        count_addr   = self.allocate_variable(self._hidden("n"), TypeCode.I64)
+        zero_addr    = self.allocate_constant(0)
+        one_addr     = self.allocate_constant(1)
+
+        # Pre-loop: counter = 0; count = <N>
+        self.emit(Opcode.LOAD,  (0, zero_addr))
+        self.emit(Opcode.STORE, (0, counter_addr))
+        n_type = self.compile_expr_into(stmt.count, reg=0)
+        self.coerce(n_type, TypeCode.I64, 0)
+        self.emit(Opcode.STORE, (0, count_addr))
+
+        def cond() -> int:
+            self.emit(Opcode.LOAD,   (1, counter_addr))
+            self.emit(Opcode.LOAD,   (2, count_addr))
+            self.emit(Opcode.LT_I64, (0, 1, 2))
+            return 0
+
+        def post() -> None:
+            self.emit(Opcode.LOAD,    (1, counter_addr))
+            self.emit(Opcode.LOAD,    (2, one_addr))
+            self.emit(Opcode.ADD_I64, (0, 1, 2))
+            self.emit(Opcode.STORE,   (0, counter_addr))
+
+        self.compile_loop(cond_emit=cond, post_emit=post, body=stmt.body)
+
+    def compile_repeat_range(self, stmt: RepeatRangeStmt) -> None:
+        # Loop variable is user-visible (`stmt.var`). Inclusive on both ends.
+        end_addr = self.allocate_variable(self._hidden("end"), TypeCode.I64)
+        one_addr = self.allocate_constant(1)
+
+        # var = start
+        start_type = self.compile_expr_into(stmt.start, reg=0)
+        self.coerce(start_type, TypeCode.I64, 0)
+        if stmt.var in self.module.symbol_table:
+            var_addr = self.module.symbol_table[stmt.var]
+        else:
+            var_addr = self.allocate_variable(stmt.var, TypeCode.I64)
+        self.emit(Opcode.STORE, (0, var_addr))
+
+        # cached_end = end
+        end_type = self.compile_expr_into(stmt.end, reg=0)
+        self.coerce(end_type, TypeCode.I64, 0)
+        self.emit(Opcode.STORE, (0, end_addr))
+
+        def cond() -> int:
+            self.emit(Opcode.LOAD,   (1, var_addr))
+            self.emit(Opcode.LOAD,   (2, end_addr))
+            self.emit(Opcode.LE_I64, (0, 1, 2))    # var <= end (inclusive)
+            return 0
+
+        def post() -> None:
+            self.emit(Opcode.LOAD,    (1, var_addr))
+            self.emit(Opcode.LOAD,    (2, one_addr))
+            self.emit(Opcode.ADD_I64, (0, 1, 2))
+            self.emit(Opcode.STORE,   (0, var_addr))
+
+        self.compile_loop(cond_emit=cond, post_emit=post, body=stmt.body)
+
+    def compile_stop(self) -> None:
+        if not self.loop_stack:
+            raise CompileError("'stop' used outside of a loop")
+        idx = self.emit_placeholder_jump(Opcode.JMP)
+        self.loop_stack[-1].break_patches.append(idx)
+
+    def compile_skip(self) -> None:
+        if not self.loop_stack:
+            raise CompileError("'skip' used outside of a loop")
+        idx = self.emit_placeholder_jump(Opcode.JMP)
+        self.loop_stack[-1].continue_patches.append(idx)
+
+    def _hidden(self, prefix: str) -> str:
+        """Unique compiler-generated name so auto-allocated loop variables
+        don't collide with user variables or each other across nested loops."""
+        self._hidden_counter += 1
+        return f"__{prefix}_{self._hidden_counter}"
 
     def emit_placeholder_jump(self, op: Opcode, r_cond: int | None = None) -> int:
         """Emit JMP/JMPF/JMPT with a placeholder target (-1). Returns the
