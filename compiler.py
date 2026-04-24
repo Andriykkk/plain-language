@@ -226,6 +226,11 @@ class Compiler:
                 addr = self.module.symbol_table[target.name]
             else:
                 addr = self.allocate_variable(target.name, value_type)
+                # If the RHS creates/carries a typed container, remember its
+                # element type so later `xs[i]` reads return the real type.
+                elem_type = self.infer_elem_type(stmt.value)
+                if elem_type is not None:
+                    self.module.symbol_elem_types[target.name] = elem_type
             self.emit(Opcode.STORE, (0, addr))
             return
 
@@ -295,7 +300,9 @@ class Compiler:
         else:
             addr = self.allocate_variable(name, TypeCode.REF)
 
+        # Shape and element type — purely compile-time metadata.
         self.module.symbol_shapes[name] = tuple(shape)
+        self.module.symbol_elem_types[name] = self.typeref_to_elem_code(em.elem_type)
         self.emit(Opcode.STORE, (0, addr))
 
     def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
@@ -320,7 +327,7 @@ class Compiler:
         self.emit(Opcode.ADD_I64, (r_idx, r_idx, r_j))
 
         self.emit(Opcode.LOAD_AT, (reg, r_ptr, r_idx))
-        return TypeCode.REF   # element type not tracked yet
+        return self._elem_type_of(expr.obj)
 
     def compile_matrix_set(self, target: IndexLValue, value_expr) -> None:
         shape = self._matrix_shape_of(target.obj)
@@ -351,6 +358,16 @@ class Compiler:
         if expr.name not in self.module.symbol_shapes:
             raise CompileError(f"{expr.name!r} is not a matrix")
         return self.module.symbol_shapes[expr.name]
+
+    def _elem_type_of(self, expr) -> TypeCode:
+        """Return the element type of the container expression `expr`.
+        Falls back to REF if the compiler doesn't know statically
+        (e.g., the container came from a function call or an indirect
+        expression). Arithmetic on a REF result will error cleanly —
+        that's a signal the caller needs to annotate more types."""
+        if isinstance(expr, VarRef):
+            return self.module.symbol_elem_types.get(expr.name, TypeCode.REF)
+        return TypeCode.REF
 
     # ----- expressions -----
 
@@ -404,7 +421,7 @@ class Compiler:
                 idx_type = self.compile_expr_into(expr.indices[0], reg + 2)
                 self.coerce(idx_type, TypeCode.I64, reg + 2)
                 self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
-                return TypeCode.REF
+                return self._elem_type_of(expr.obj)
             if len(expr.indices) == 2:
                 return self.compile_matrix_get(expr, reg)
             raise CompileError("only 1D or 2D indexing supported")
@@ -574,6 +591,30 @@ class Compiler:
                 f"(expected one of: {', '.join(sorted(PRIMITIVE_TYPES))})"
             )
         return PRIMITIVE_TYPES[type_ref.name]
+
+    def typeref_to_elem_code(self, type_ref: TypeRef) -> TypeCode:
+        """Map a TypeRef used as an *element* type. Primitives map normally;
+        nested collections / record names become REF (opaque pointer)."""
+        if type_ref.name in PRIMITIVE_TYPES:
+            return PRIMITIVE_TYPES[type_ref.name]
+        return TypeCode.REF
+
+    def infer_elem_type(self, expr) -> TypeCode | None:
+        """For an expression that produces a container, return the type of
+        its elements if the compiler can see it statically. Returns None
+        when the element type isn't known (e.g., a function call returning
+        a list)."""
+        if isinstance(expr, EmptyList):
+            return self.typeref_to_elem_code(expr.elem_type)
+        if isinstance(expr, EmptyMatrix):
+            return self.typeref_to_elem_code(expr.elem_type)
+        if isinstance(expr, StringLit):
+            # Text is an array of i8 character codes.
+            return TypeCode.I8
+        if isinstance(expr, VarRef):
+            # Inherit the source variable's element type.
+            return self.module.symbol_elem_types.get(expr.name)
+        return None
 
     def coerce(self, from_type: TypeCode, to_type: TypeCode, reg: int) -> None:
         """Emit a conversion in `reg` if needed. No-op when types match."""

@@ -127,6 +127,10 @@ class Module:
     # For matrix variables: the compile-time-known shape (rows, cols, ...).
     # The VM doesn't know this — matrices are just flat arrays at runtime.
     symbol_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # For list / matrix / text variables: the type of the elements inside.
+    # Used so that e.g. `xs[i]` can return its real element type instead of
+    # the generic REF the VM sees.
+    symbol_elem_types: dict[str, TypeCode] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
