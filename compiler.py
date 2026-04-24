@@ -12,8 +12,8 @@ to the common result type. Division of two integers produces F64.
 
 from bytecode import Instruction, Module, Opcode, TypeCode
 from parser import (
-    AppendStmt, BinaryOp, BoolLit, ColumnsExpr, EmptyList, EmptyMatrix,
-    IndexAccess, IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt,
+    AppendStmt, BinaryOp, BoolLit, ColumnsExpr, Compare, EmptyList, EmptyMatrix,
+    IfStmt, IndexAccess, IndexLValue, LengthExpr, NoneLit, NumberLit, PrintStmt,
     RowsExpr, SetStmt, Stmt, StringLit, TypeRef, VarLValue, VarRef,
 )
 
@@ -127,6 +127,26 @@ _CVT_OPCODES: dict[tuple[TypeCode, TypeCode], Opcode] = {
 }
 
 
+# Comparison opcode per (op, type). The op string comes from the AST's
+# Compare node: "equal" | "not_equal" | "less" | "at_most" | "greater" | "at_least".
+_CMP_OPCODES: dict[tuple[str, TypeCode], Opcode] = {}
+for _ty, _suffix in [
+    (TypeCode.I8,  "I8"),  (TypeCode.I32, "I32"), (TypeCode.I64, "I64"),
+    (TypeCode.F32, "F32"), (TypeCode.F64, "F64"),
+]:
+    _CMP_OPCODES[("equal",     _ty)] = getattr(Opcode, f"EQ_{_suffix}")
+    _CMP_OPCODES[("not_equal", _ty)] = getattr(Opcode, f"NE_{_suffix}")
+    _CMP_OPCODES[("less",      _ty)] = getattr(Opcode, f"LT_{_suffix}")
+    _CMP_OPCODES[("at_most",   _ty)] = getattr(Opcode, f"LE_{_suffix}")
+    _CMP_OPCODES[("greater",   _ty)] = getattr(Opcode, f"GT_{_suffix}")
+    _CMP_OPCODES[("at_least",  _ty)] = getattr(Opcode, f"GE_{_suffix}")
+
+_CMP_OPCODES[("equal",     TypeCode.BOOL)] = Opcode.EQ_BOOL
+_CMP_OPCODES[("not_equal", TypeCode.BOOL)] = Opcode.NE_BOOL
+_CMP_OPCODES[("equal",     TypeCode.REF)]  = Opcode.EQ_REF
+_CMP_OPCODES[("not_equal", TypeCode.REF)]  = Opcode.NE_REF
+
+
 class Compiler:
     def __init__(self) -> None:
         self.module: Module = Module()
@@ -149,6 +169,8 @@ class Compiler:
             return self.compile_append(stmt)
         if isinstance(stmt, PrintStmt):
             return self.compile_print(stmt)
+        if isinstance(stmt, IfStmt):
+            return self.compile_if(stmt)
         raise CompileError(f"unsupported statement: {type(stmt).__name__}")
 
     def compile_set(self, stmt: SetStmt) -> None:
@@ -360,6 +382,9 @@ class Compiler:
         if isinstance(expr, BinaryOp):
             return self.compile_binop(expr, reg)
 
+        if isinstance(expr, Compare):
+            return self.compile_compare(expr, reg)
+
         if isinstance(expr, EmptyList):
             self.emit(Opcode.ALLOC, (reg, 0))
             return TypeCode.REF
@@ -423,6 +448,103 @@ class Compiler:
         opcode = _ARITH_OPCODES[(expr.op, result_type)]
         self.emit(opcode, (reg, left_reg, right_reg))
         return result_type
+
+    def compile_compare(self, expr: Compare, reg: int) -> TypeCode:
+        """Typed comparison. Same promotion rules as arithmetic for numeric
+        operands. Result is always BOOL."""
+        left_reg  = reg + 1
+        right_reg = reg + 2
+
+        left_type  = self.compile_expr_into(expr.left,  left_reg)
+        right_type = self.compile_expr_into(expr.right, right_reg)
+
+        if left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES:
+            cmp_type = _PROMOTE[(left_type, right_type)]
+            self.coerce(left_type,  cmp_type, left_reg)
+            self.coerce(right_type, cmp_type, right_reg)
+        elif left_type == right_type:
+            cmp_type = left_type
+            # TEXT is an array at runtime — use REF opcodes for it.
+            if cmp_type == TypeCode.TEXT:
+                cmp_type = TypeCode.REF
+        else:
+            raise CompileError(
+                f"cannot compare {left_type.name} with {right_type.name}"
+            )
+
+        key = (expr.op, cmp_type)
+        if key not in _CMP_OPCODES:
+            raise CompileError(
+                f"comparison {expr.op!r} not supported on {cmp_type.name}"
+            )
+        self.emit(_CMP_OPCODES[key], (reg, left_reg, right_reg))
+        return TypeCode.BOOL
+
+    # ----- control flow -----
+
+    def compile_if(self, stmt: IfStmt) -> None:
+        """Compile `if cond then-body [else else-body] end` with forward
+        jump-patching. `else if` chains parse as nested IfStmts in the
+        else_block, and this method handles them naturally via recursion —
+        each nested IfStmt emits its own jumps that get patched at its own
+        end, propagating outward.
+        """
+        # Compile the condition into r0.
+        cond_type = self.compile_expr_into(stmt.condition, reg=0)
+        if cond_type != TypeCode.BOOL:
+            raise CompileError(
+                f"if condition must be BOOL, got {cond_type.name}"
+            )
+
+        # Emit JMPF to a placeholder — patched either to the else branch
+        # (if there is one) or to the position after the then-body.
+        jmpf_idx = self.emit_placeholder_jump(Opcode.JMPF, r_cond=0)
+
+        for s in stmt.then_block:
+            self.compile_stmt(s)
+
+        if stmt.else_block is None:
+            # No else — JMPF just skips the then-body.
+            self.patch_jmp_target(jmpf_idx, self.current_pos())
+            return
+
+        # With else — emit an unconditional JMP past the else-body, then
+        # patch the JMPF to land at the start of the else-body.
+        jmp_end_idx = self.emit_placeholder_jump(Opcode.JMP)
+        self.patch_jmp_target(jmpf_idx, self.current_pos())
+
+        for s in stmt.else_block:
+            self.compile_stmt(s)
+
+        # Patch the "skip else" jump to land past the else-body.
+        self.patch_jmp_target(jmp_end_idx, self.current_pos())
+
+    def emit_placeholder_jump(self, op: Opcode, r_cond: int | None = None) -> int:
+        """Emit JMP/JMPF/JMPT with a placeholder target (-1). Returns the
+        instruction index so the caller can patch it later."""
+        idx = len(self.module.code)
+        if op is Opcode.JMP:
+            self.module.code.append(Instruction(op, (-1,)))
+        elif op in (Opcode.JMPF, Opcode.JMPT):
+            assert r_cond is not None, "JMPF/JMPT need a condition register"
+            self.module.code.append(Instruction(op, (r_cond, -1)))
+        else:
+            raise CompileError(f"not a jump opcode: {op}")
+        return idx
+
+    def patch_jmp_target(self, idx: int, target: int) -> None:
+        """Rewrite the placeholder target at `idx` with the real target."""
+        instr = self.module.code[idx]
+        if instr.op is Opcode.JMP:
+            new_operands = (target,)
+        elif instr.op in (Opcode.JMPF, Opcode.JMPT):
+            new_operands = (instr.operands[0], target)
+        else:
+            raise CompileError(f"patch_jmp_target on non-jump opcode: {instr.op}")
+        self.module.code[idx] = Instruction(instr.op, new_operands, instr.line)
+
+    def current_pos(self) -> int:
+        return len(self.module.code)
 
     def compile_expr_into_lvalue(self, lv, reg: int) -> TypeCode:
         if isinstance(lv, VarLValue):

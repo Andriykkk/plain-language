@@ -80,6 +80,21 @@ class Opcode(Enum):
     CVT_F32_I32 = auto(); CVT_F32_I64 = auto()
     CVT_F64_I32 = auto(); CVT_F64_I64 = auto()
 
+    # Typed comparisons — result is BOOL in r_dst.
+    EQ_I8  = auto(); NE_I8  = auto(); LT_I8  = auto(); LE_I8  = auto(); GT_I8  = auto(); GE_I8  = auto()
+    EQ_I32 = auto(); NE_I32 = auto(); LT_I32 = auto(); LE_I32 = auto(); GT_I32 = auto(); GE_I32 = auto()
+    EQ_I64 = auto(); NE_I64 = auto(); LT_I64 = auto(); LE_I64 = auto(); GT_I64 = auto(); GE_I64 = auto()
+    EQ_F32 = auto(); NE_F32 = auto(); LT_F32 = auto(); LE_F32 = auto(); GT_F32 = auto(); GE_F32 = auto()
+    EQ_F64 = auto(); NE_F64 = auto(); LT_F64 = auto(); LE_F64 = auto(); GT_F64 = auto(); GE_F64 = auto()
+    EQ_BOOL = auto(); NE_BOOL = auto()
+    EQ_REF  = auto(); NE_REF  = auto()
+
+    # Control flow. `target` is an absolute instruction index in the code list.
+    # Placeholder target of None during compilation; patched when known.
+    JMP  = auto()  # (target,)
+    JMPF = auto()  # (r_cond, target)   — jump if r_cond is false
+    JMPT = auto()  # (r_cond, target)   — jump if r_cond is true
+
     PRINT      = auto()  # (r_src,)           — print the value directly
     PRINT_TEXT = auto()  # (r_src,)           — register holds a list of character
                          #                      codes; decode back to a string and print

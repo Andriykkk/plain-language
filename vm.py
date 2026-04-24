@@ -17,6 +17,31 @@ MEMORY_SIZE = 4096       # total memory slots
 REGISTER_COUNT = 32      # scratch register pool
 
 
+# Opcode groups for comparison dispatch — all variants of each operator
+# share one handler in Python (the type distinction matters for codegen
+# to native, not here).
+_EQ_OPS = frozenset({
+    Opcode.EQ_I8, Opcode.EQ_I32, Opcode.EQ_I64, Opcode.EQ_F32, Opcode.EQ_F64,
+    Opcode.EQ_BOOL, Opcode.EQ_REF,
+})
+_NE_OPS = frozenset({
+    Opcode.NE_I8, Opcode.NE_I32, Opcode.NE_I64, Opcode.NE_F32, Opcode.NE_F64,
+    Opcode.NE_BOOL, Opcode.NE_REF,
+})
+_LT_OPS = frozenset({
+    Opcode.LT_I8, Opcode.LT_I32, Opcode.LT_I64, Opcode.LT_F32, Opcode.LT_F64,
+})
+_LE_OPS = frozenset({
+    Opcode.LE_I8, Opcode.LE_I32, Opcode.LE_I64, Opcode.LE_F32, Opcode.LE_F64,
+})
+_GT_OPS = frozenset({
+    Opcode.GT_I8, Opcode.GT_I32, Opcode.GT_I64, Opcode.GT_F32, Opcode.GT_F64,
+})
+_GE_OPS = frozenset({
+    Opcode.GE_I8, Opcode.GE_I32, Opcode.GE_I64, Opcode.GE_F32, Opcode.GE_F64,
+})
+
+
 def execute(module: Module) -> None:
     # Memory = constants + variables pre-populated by the compiler,
     # padded with empty slots for future dynamic allocations.
@@ -34,6 +59,29 @@ def execute(module: Module) -> None:
         instr = code[ip]
         op = instr.op
         operands = instr.operands
+
+        # --- control flow (set ip and skip the default increment) ---
+
+        if op is Opcode.JMP:
+            ip = operands[0]
+            continue
+
+        if op is Opcode.JMPF:
+            r_cond, target = operands
+            if not registers[r_cond]:
+                ip = target
+                continue
+            # Fall through to the default `ip += 1` below.
+            ip += 1
+            continue
+
+        if op is Opcode.JMPT:
+            r_cond, target = operands
+            if registers[r_cond]:
+                ip = target
+                continue
+            ip += 1
+            continue
 
         if op is Opcode.LOAD:
             r_dst, addr = operands
@@ -123,6 +171,27 @@ def execute(module: Module) -> None:
              or op is Opcode.CVT_F64_I32 or op is Opcode.CVT_F64_I64:
             r_dst, r_src = operands
             registers[r_dst] = int(registers[r_src])
+
+        # --- typed comparisons (all produce BOOL; collapse to Python ops) ---
+
+        elif op in _EQ_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] == registers[r_b]
+        elif op in _NE_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] != registers[r_b]
+        elif op in _LT_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] < registers[r_b]
+        elif op in _LE_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] <= registers[r_b]
+        elif op in _GT_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] > registers[r_b]
+        elif op in _GE_OPS:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] >= registers[r_b]
 
         elif op is Opcode.PRINT:
             (r_src,) = operands

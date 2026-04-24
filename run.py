@@ -16,23 +16,53 @@ def run(source: str, show_bytecode: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    demo = '''set s to "hello"
-print s                    # hello
+    demo = '''# simple if / else
+set x to 5
+if x is greater than 0
+    print "positive"
+else
+    print "non-positive"
+end
 
-# Assigning a single-character string: compiler converts "H" → 72
-set s[0] to "H"
-print s                    # Hello
+# if with no else
+set y to 10
+if y is equal to 10
+    print "ten"
+end
 
-# Assigning a number directly: stored as-is (33 = '!')
-set s[4] to 33
-print s                    # Hell!
+# else-if chain
+set grade to 72
+if grade is at least 90
+    print "A"
+else if grade is at least 80
+    print "B"
+else if grade is at least 70
+    print "C"
+else
+    print "F"
+end
 
-# Assigning an i8 value from elsewhere (another char in the same text)
-set s[1] to s[4]           # s[1] = 33 ('!')
-print s                    # H!ll!
+# nested ifs
+set a to 5
+set b to 3
+if a is greater than 0
+    if b is greater than 0
+        print "both positive"
+    else
+        print "only a positive"
+    end
+end
 
-# The individual slots are still just numbers
-print s[0]                 # 72
-print s[1]                 # 33
+# comparison with mixed types — a is i64, 4.5 is f64; compiler promotes
+if a is greater than 4.5
+    print "greater than 4.5"
+end
+
+# comparison on text
+set s to "hello"
+set t to "hello"
+if s is equal to t
+    print "strings match"
+end
 '''
     run(demo)
