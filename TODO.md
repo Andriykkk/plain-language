@@ -36,7 +36,6 @@ Matrix element types aren't tracked — reading m[i, j] still returns REF (opaqu
 
 
 [ ]
-Compound assignments (add N to x, subtract, multiply, divide)	No handler for AddStmt etc.	~15 tests
 All repeat loop forms (N times, for i from X to Y, while, for each)	No loop compiler	~15 tests
 stop / skip	Same (needs loop context stack)	2 tests
 Functions (define function, call, return)	No function compiler	~10 tests

@@ -137,7 +137,10 @@ class TestStatementOps(unittest.TestCase):
         self.assertEqual(run_capture("set x to 4\nmultiply x by 3\nprint x\n"), "12\n")
 
     def test_divide_by(self):
-        self.assertEqual(run_capture("set x to 10\ndivide x by 4\nprint x\n"), "2.5\n")
+        # `x` is declared i64; the float result of `/` is narrowed back to i64
+        # on assignment (truncation toward zero). To keep the float, use an
+        # f64 variable.
+        self.assertEqual(run_capture("set x to 10\ndivide x by 4\nprint x\n"), "2\n")
 
     def test_all_four_in_sequence(self):
         src = """set x to 10
@@ -147,7 +150,7 @@ multiply x by 2
 divide x by 4
 print x
 """
-        self.assertEqual(run_capture(src), "6.0\n")
+        self.assertEqual(run_capture(src), "6\n")
 
 
 class TestPrint(unittest.TestCase):
@@ -559,7 +562,7 @@ class TestRecords(unittest.TestCase):
     def test_define_and_set_fields(self):
         src = """define record Person
     name as text
-    age as number
+    age as i64
 end
 
 set u to new Person
@@ -567,7 +570,20 @@ set u.name to "Alice"
 set u.age to 30
 print u.name and u.age
 """
-        self.assertEqual(run_capture(src), "Alice 30\n")
+        self.assertEqual(run_capture(src), "Alice\n30\n")
+
+    def test_define_and_set_fields_float(self):
+        src = """define record Person
+    name as text
+    age as float
+end
+
+set u to new Person
+set u.name to "Alice"
+set u.age to 30
+print u.name and u.age
+"""
+        self.assertEqual(run_capture(src), "Alice\n30.0\n")
 
     def test_default_field_values(self):
         # number defaults to 0, text to "", list to [], map to {}
@@ -598,8 +614,8 @@ print a.balance
 
     def test_multiply_field(self):
         src = """define record Rect
-    w as number
-    h as number
+    w as i64
+    h as i64
 end
 
 set r to new Rect
@@ -609,6 +625,20 @@ multiply r.w by r.h
 print r.w
 """
         self.assertEqual(run_capture(src), "20\n")
+
+    def test_multiply_field_float(self):
+        src = """define record Rect
+    w as float
+    h as float
+end
+
+set r to new Rect
+set r.w to 4
+set r.h to 5
+multiply r.w by r.h
+print r.w
+"""
+        self.assertEqual(run_capture(src), "20.0\n")
 
     def test_nested_field_access(self):
         src = """define record Inner
@@ -629,13 +659,23 @@ print o.inner.value
 
     def test_end_record_closes_record(self):
         src = """define record R
-    x as number
+    x as i64
 end record
 
 set r to new R
 print r.x
 """
         self.assertEqual(run_capture(src), "0\n")
+
+    def test_end_record_closes_record_float(self):
+        src = """define record R
+    x as float
+end record
+
+set r to new R
+print r.x
+"""
+        self.assertEqual(run_capture(src), "0.0\n")
 
     def test_mismatched_end_if_on_record_errors(self):
         src = """define record R
