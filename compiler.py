@@ -14,11 +14,12 @@ from dataclasses import dataclass, field
 
 from bytecode import Instruction, Module, Opcode, RecordLayout, TypeCode
 from parser import (
-    AppendStmt, BinaryOp, BoolLit, ColumnsExpr, Compare, EmptyList, EmptyMatrix,
-    FieldAccess, FieldLValue, IfStmt, IndexAccess, IndexLValue, LengthExpr,
-    NewExpr, NoneLit, NumberLit, PrintStmt, RecordDef, RepeatForEachStmt,
-    RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt, RowsExpr, SetStmt,
-    SkipStmt, Stmt, StopStmt, StringLit, TypeRef, VarLValue, VarRef,
+    AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, ColumnsExpr, Compare,
+    EmptyList, EmptyMatrix, FieldAccess, FieldLValue, FunctionDef, IfStmt,
+    IndexAccess, IndexLValue, LengthExpr, NewExpr, NoneLit, NumberLit,
+    PrintStmt, RecordDef, RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt,
+    RepeatWhileStmt, ReturnStmt, RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt,
+    StringLit, TypeRef, VarLValue, VarRef,
 )
 
 
@@ -30,6 +31,19 @@ class LoopContext:
     once the loop's structure is fully emitted."""
     break_patches: list[int] = field(default_factory=list)
     continue_patches: list[int] = field(default_factory=list)
+
+
+@dataclass
+class FunctionInfo:
+    """Compile-time record of a function: where its body lives, what
+    arguments it takes (in declaration order), and what it returns.
+    Parameters live on the stack — the caller pushes them in order, so at
+    function entry the i-th parameter sits at offset (N - i) above the
+    return address."""
+    name: str
+    entry: int
+    params: list[tuple[str, TypeCode]]
+    return_type: TypeCode | None
 
 
 class CompileError(Exception):
@@ -166,15 +180,53 @@ class Compiler:
         self.module: Module = Module()
         self.loop_stack: list[LoopContext] = []
         self._hidden_counter: int = 0
+        # Function table — populated as `define function` statements are
+        # encountered. Compiled bodies live at the start of the bytecode,
+        # before main entry.
+        self.functions: dict[str, FunctionInfo] = {}
+        # Set while compiling a function body. None at top level.
+        self.current_func: FunctionInfo | None = None
+        # name → index in current_func.params (only populated inside a body).
+        self.param_indices: dict[str, int] = {}
+        # How many extra slots the current body has pushed onto the stack
+        # since its entry, but not yet popped. Parameter offsets shift by
+        # this much each time we read them.
+        self.stack_delta: int = 0
+        # Memory address of the single shared "return value" slot. Allocated
+        # lazily on first function-related code; functions store their result
+        # here on RET, callers LOAD it after CALL.
+        self.return_slot_addr: int | None = None
 
     # ----- entry -----
 
     def compile_program(self, stmts: list[Stmt]) -> Module:
+        # Source order is preserved. FunctionDefs emit their bodies inline,
+        # wrapped in a JMP that jumps past the body so straight-line
+        # execution doesn't fall into it. Functions self-recurse fine
+        # (registered before their body is compiled), but mutual recursion
+        # and forward calls require the callee to be defined first.
         self.module.entry = 0
         for stmt in stmts:
             self.compile_stmt(stmt)
         self.emit(Opcode.HALT, ())
         return self.module
+
+    # ----- stack-tracking emission helpers -----
+
+    def emit_push(self, reg: int) -> None:
+        self.emit(Opcode.PUSH, (reg,))
+        self.stack_delta += 1
+
+    def emit_drop(self, count: int) -> None:
+        if count <= 0:
+            return
+        self.emit(Opcode.DROP, (count,))
+        self.stack_delta -= count
+
+    def _ensure_return_slot(self) -> int:
+        if self.return_slot_addr is None:
+            self.return_slot_addr = self.allocate_constant(None)
+        return self.return_slot_addr
 
     # ----- statements -----
 
@@ -203,6 +255,12 @@ class Compiler:
             return self.compile_stop()
         if isinstance(stmt, SkipStmt):
             return self.compile_skip()
+        if isinstance(stmt, FunctionDef):
+            return self.compile_function_def(stmt)
+        if isinstance(stmt, ReturnStmt):
+            return self.compile_return(stmt)
+        if isinstance(stmt, CallStmt):
+            return self.compile_call_stmt(stmt)
         raise CompileError(f"unsupported statement: {type(stmt).__name__}")
 
     def compile_set(self, stmt: SetStmt) -> None:
@@ -239,6 +297,14 @@ class Compiler:
 
         # ----- set x to value [as <type>] -----
         if isinstance(target, VarLValue):
+            # Writing to a parameter would need STORE_STACK with the same
+            # offset arithmetic as the read side; intentionally not supported
+            # in v1 to keep the calling convention strictly value-in.
+            if self.current_func is not None and target.name in self.param_indices:
+                raise CompileError(
+                    f"cannot assign to parameter {target.name!r}; "
+                    f"copy it into a local first"
+                )
             value_type = self.compile_expr_into(stmt.value, reg=0)
 
             # If the user annotated with `as <type>`, convert to it.
@@ -540,6 +606,29 @@ class Compiler:
             raise CompileError(f"{expr.name!r} is not a matrix")
         return self.module.symbol_shapes[expr.name]
 
+    def _contains_call(self, expr) -> bool:
+        """True if evaluating `expr` could emit a CALL — meaning all
+        registers might be clobbered. Used to decide when a parent
+        expression needs to spill an in-register value to the stack across
+        the compute of `expr`."""
+        if isinstance(expr, CallExpr):
+            return True
+        # Walk dataclass children — anything with sub-expressions could
+        # transitively contain a call.
+        if isinstance(expr, BinaryOp):
+            return self._contains_call(expr.left) or self._contains_call(expr.right)
+        if isinstance(expr, Compare):
+            return self._contains_call(expr.left) or self._contains_call(expr.right)
+        if isinstance(expr, IndexAccess):
+            if self._contains_call(expr.obj):
+                return True
+            return any(self._contains_call(i) for i in expr.indices)
+        if isinstance(expr, FieldAccess):
+            return self._contains_call(expr.obj)
+        if isinstance(expr, (LengthExpr, RowsExpr, ColumnsExpr)):
+            return self._contains_call(expr.value)
+        return False
+
     def _elem_type_of(self, expr) -> TypeCode:
         """Return the element type of the container expression `expr`.
         Falls back to REF if the compiler doesn't know statically
@@ -579,12 +668,26 @@ class Compiler:
             return TypeCode.NONE
 
         if isinstance(expr, VarRef):
+            # Inside a function body, parameter names resolve to stack
+            # slots, not main memory. The arg the caller pushed for
+            # params[i] sits at offset (N - i) above the return address;
+            # add the body's running stack_delta since extra pushes inside
+            # the body shift everything up.
+            if self.current_func is not None and expr.name in self.param_indices:
+                idx = self.param_indices[expr.name]
+                n_params = len(self.current_func.params)
+                offset = (n_params - idx) + self.stack_delta
+                self.emit(Opcode.LOAD_STACK, (reg, offset))
+                return self.current_func.params[idx][1]
             if expr.name not in self.module.symbol_table:
                 raise CompileError(f"undeclared variable {expr.name!r}")
             addr = self.module.symbol_table[expr.name]
             ty = self.module.symbol_types[expr.name]
             self.emit(Opcode.LOAD, (reg, addr))
             return ty
+
+        if isinstance(expr, CallExpr):
+            return self.compile_call(expr, reg)
 
         if isinstance(expr, BinaryOp):
             return self.compile_binop(expr, reg)
@@ -644,8 +747,17 @@ class Compiler:
         left_reg  = reg + 1
         right_reg = reg + 2
 
-        left_type  = self.compile_expr_into(expr.left,  left_reg)
+        left_type = self.compile_expr_into(expr.left, left_reg)
+        # A function CALL clobbers every register, so if computing the right
+        # operand might invoke one, spill the left value to the stack across
+        # the right-side compute and restore it afterwards.
+        spill = self._contains_call(expr.right)
+        if spill:
+            self.emit_push(left_reg)
         right_type = self.compile_expr_into(expr.right, right_reg)
+        if spill:
+            self.emit(Opcode.POP, (left_reg,))
+            self.stack_delta -= 1
 
         if left_type not in NUMERIC_TYPES or right_type not in NUMERIC_TYPES:
             raise CompileError(
@@ -672,8 +784,14 @@ class Compiler:
         left_reg  = reg + 1
         right_reg = reg + 2
 
-        left_type  = self.compile_expr_into(expr.left,  left_reg)
+        left_type = self.compile_expr_into(expr.left, left_reg)
+        spill = self._contains_call(expr.right)
+        if spill:
+            self.emit_push(left_reg)
         right_type = self.compile_expr_into(expr.right, right_reg)
+        if spill:
+            self.emit(Opcode.POP, (left_reg,))
+            self.stack_delta -= 1
 
         if left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES:
             cmp_type = _PROMOTE[(left_type, right_type)]
@@ -870,6 +988,131 @@ class Compiler:
             raise CompileError("'skip' used outside of a loop")
         idx = self.emit_placeholder_jump(Opcode.JMP)
         self.loop_stack[-1].continue_patches.append(idx)
+
+    # ----- functions -----
+    #
+    # Calling convention:
+    #   1. Caller compiles each argument and PUSHes it (in declaration order).
+    #   2. Caller emits CALL — the VM pushes the return address and jumps.
+    #   3. Callee body runs. Parameter reads use LOAD_STACK relative to SP;
+    #      offsets are tracked at compile time via stack_delta so that any
+    #      pushes the body itself does (e.g., for a nested call) shift the
+    #      param offsets correctly.
+    #   4. `return X` stores X into the shared return slot, then RET.
+    #   5. Caller LOADs the result from the return slot, then DROPs the
+    #      arguments. Result lives in the caller's destination register.
+    #
+    # The return slot is a single heap-memory address. It's clobbered on each
+    # call, so callers must consume the result before another call happens —
+    # which is the natural compilation order anyway (every CallExpr's result
+    # is loaded into a register or pushed before any further code runs).
+
+    def compile_function_def(self, fd: FunctionDef) -> None:
+        if fd.name in self.functions:
+            raise CompileError(f"function {fd.name!r} defined twice")
+        if self.current_func is not None:
+            raise CompileError(
+                "nested function definitions aren't supported"
+            )
+
+        params: list[tuple[str, TypeCode]] = []
+        for pname, ptype in fd.params:
+            params.append((pname, self.typeref_to_elem_code(ptype)))
+        return_type = (
+            self.typeref_to_code(fd.return_type) if fd.return_type is not None else None
+        )
+
+        # Functions are emitted inline in source order, so we need to jump
+        # over the body at runtime — otherwise straight-line execution from
+        # the surrounding code would fall right into it.
+        skip_idx = self.emit_placeholder_jump(Opcode.JMP)
+
+        info = FunctionInfo(
+            name=fd.name,
+            entry=self.current_pos(),
+            params=params,
+            return_type=return_type,
+        )
+        # Register before the body so the function can call itself.
+        self.functions[fd.name] = info
+
+        prev_func, prev_indices, prev_delta = (
+            self.current_func, self.param_indices, self.stack_delta
+        )
+        self.current_func = info
+        self.param_indices = {name: i for i, (name, _) in enumerate(params)}
+        self.stack_delta = 0
+
+        for s in fd.body:
+            self.compile_stmt(s)
+        # Implicit RET — covers bodies that don't end with an explicit return.
+        # If the body did end with `return`, this is unreachable but harmless.
+        self.emit(Opcode.RET, ())
+
+        self.current_func = prev_func
+        self.param_indices = prev_indices
+        self.stack_delta = prev_delta
+
+        self.patch_jmp_target(skip_idx, self.current_pos())
+
+    def compile_call(self, ce: CallExpr, reg: int) -> TypeCode:
+        if ce.name not in self.functions:
+            raise CompileError(f"unknown function {ce.name!r}")
+        info = self.functions[ce.name]
+        if len(ce.args) != len(info.params):
+            raise CompileError(
+                f"function {ce.name!r} expects {len(info.params)} argument(s), "
+                f"got {len(ce.args)}"
+            )
+
+        # Evaluate and push each argument. Compiling into r0 is safe because
+        # every arg's value is consumed by PUSH before the next arg starts;
+        # nested calls inside an arg follow the same pattern internally.
+        for i, arg in enumerate(ce.args):
+            arg_type = self.compile_expr_into(arg, reg=0)
+            param_type = info.params[i][1]
+            if arg_type != param_type:
+                if arg_type in NUMERIC_TYPES and param_type in NUMERIC_TYPES:
+                    self.emit_convert(arg_type, param_type, src=0, dst=0)
+                else:
+                    raise CompileError(
+                        f"argument {i + 1} of {ce.name!r}: cannot pass "
+                        f"{arg_type.name} where {param_type.name} expected"
+                    )
+            self.emit_push(0)
+
+        self.emit(Opcode.CALL, (info.entry,))
+
+        # Pick up the result from the shared return slot, then drop the args.
+        ret_slot = self._ensure_return_slot()
+        self.emit(Opcode.LOAD, (reg, ret_slot))
+        self.emit_drop(len(ce.args))
+
+        return info.return_type if info.return_type is not None else TypeCode.NONE
+
+    def compile_call_stmt(self, cs: CallStmt) -> None:
+        # `call f with ...` as a statement: evaluate, discard result.
+        self.compile_call(cs.call, reg=0)
+
+    def compile_return(self, rs: ReturnStmt) -> None:
+        if self.current_func is None:
+            raise CompileError("'return' used outside of a function")
+
+        if rs.value is not None:
+            ret_type = self.compile_expr_into(rs.value, reg=0)
+            declared = self.current_func.return_type
+            if declared is not None and ret_type != declared:
+                if ret_type in NUMERIC_TYPES and declared in NUMERIC_TYPES:
+                    self.emit_convert(ret_type, declared, src=0, dst=0)
+                else:
+                    raise CompileError(
+                        f"function {self.current_func.name!r} declared to return "
+                        f"{declared.name}, got {ret_type.name}"
+                    )
+            ret_slot = self._ensure_return_slot()
+            self.emit(Opcode.STORE, (0, ret_slot))
+
+        self.emit(Opcode.RET, ())
 
     def _hidden(self, prefix: str) -> str:
         """Unique compiler-generated name so auto-allocated loop variables

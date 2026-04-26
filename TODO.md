@@ -15,6 +15,17 @@ No runtime type verification — the compiler tracks types, but bad bytecode (e.
 No call-stack depth limit — deep recursion will hit Python's recursion limit.
 
 
+[ ] I've looked at compiler.py and bytecode.py. Current state — records, matrices, lists, if/else, and repeat times/range/while all work. What's still unimplemented and showing up in tests:
+
+repeat for each — iterate lists, matrices, strings. compile_stmt explicitly raises "not implemented yet" for compile_stmt:198-201. Unblocks ~4 tests.
+Maps — empty map of text to number, set/get by key, length. No opcodes exist. Unblocks ~4 tests.
+Functions — define function, input/output, call, return. Needs CALL/RET opcodes, frame/stack model. Biggest change — unblocks ~14 tests.
+Print joins parts with spaces — print "answer is" and x should produce answer is 42, currently prints each part on its own line.
+Nested field access — o.inner.value. _resolve_field requires obj_expr to be a VarRef compiler.py:514, so chained access doesn't work.
+3D matrix — empty matrix 2 by 2 by 2. compile_set_matrix hardcodes len(shape) != 2 rejection compiler.py:331-332.
+Which do you want to tackle first? I'd suggest repeat for each — smallest surface area, reuses existing LOAD_AT/LEN, and makes list/matrix tests finally usable end-to-end
+
+
 [ ]
 No I8, I16, or unsigned types. Same opcode family pattern — add when needed.
 No overflow checking. Python ints don't overflow; the compiler's type contract is the only guarantee. A C port would need real-wraparound semantics.

@@ -15,6 +15,7 @@ class VMError(Exception):
 
 MEMORY_SIZE = 4096       # total memory slots
 REGISTER_COUNT = 32      # scratch register pool
+STACK_SIZE = 1024        # value-stack capacity (downward-growing)
 
 
 # Opcode groups for comparison dispatch — all variants of each operator
@@ -51,6 +52,12 @@ def execute(module: Module) -> None:
 
     registers: list = [None] * REGISTER_COUNT
 
+    # Value stack. CPU-style: `sp` is the index of the topmost valid element
+    # (or STACK_SIZE when the stack is empty — one past the end of the array).
+    # PUSH decrements then writes; POP reads then increments.
+    stack: list = [None] * STACK_SIZE
+    sp = STACK_SIZE
+
     code = module.code
     n = len(code)
     ip = module.entry
@@ -81,6 +88,19 @@ def execute(module: Module) -> None:
                 ip = target
                 continue
             ip += 1
+            continue
+
+        if op is Opcode.CALL:
+            (target,) = operands
+            sp -= 1
+            stack[sp] = ip + 1     # return address
+            ip = target
+            continue
+
+        if op is Opcode.RET:
+            ret_addr = stack[sp]
+            sp += 1
+            ip = ret_addr
             continue
 
         if op is Opcode.LOAD:
@@ -116,6 +136,30 @@ def execute(module: Module) -> None:
         elif op is Opcode.LEN:
             r_dst, r_ptr = operands
             registers[r_dst] = len(registers[r_ptr])
+
+        # --- value stack ------------------------------------------------------
+
+        elif op is Opcode.PUSH:
+            (r_src,) = operands
+            sp -= 1
+            stack[sp] = registers[r_src]
+
+        elif op is Opcode.POP:
+            (r_dst,) = operands
+            registers[r_dst] = stack[sp]
+            sp += 1
+
+        elif op is Opcode.DROP:
+            (count,) = operands
+            sp += count
+
+        elif op is Opcode.LOAD_STACK:
+            r_dst, offset = operands
+            registers[r_dst] = stack[sp + offset]
+
+        elif op is Opcode.STORE_STACK:
+            r_src, offset = operands
+            stack[sp + offset] = registers[r_src]
 
         # --- typed arithmetic -------------------------------------------------
         # In Python, all four integer widths and both float widths dispatch

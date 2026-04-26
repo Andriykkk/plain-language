@@ -95,6 +95,22 @@ class Opcode(Enum):
     JMPF = auto()  # (r_cond, target)   — jump if r_cond is false
     JMPT = auto()  # (r_cond, target)   — jump if r_cond is true
 
+    # Stack & function ops.
+    #
+    # The VM has a single global value stack (separate from `memory`). It
+    # grows downward, CPU-style: `sp` decreases on PUSH, increases on POP.
+    # No frames — argument layout is the caller's contract with the callee,
+    # tracked entirely at compile time. Return value travels through a
+    # dedicated heap slot (allocated on first use), so the result survives
+    # arbitrary register churn between RET and the caller picking it up.
+    PUSH        = auto()  # (r_src,)            — sp -= 1; stack[sp] = r_src
+    POP         = auto()  # (r_dst,)            — r_dst = stack[sp]; sp += 1
+    DROP        = auto()  # (count,)            — sp += count   (discard N slots)
+    LOAD_STACK  = auto()  # (r_dst, offset)     — r_dst = stack[sp + offset]
+    STORE_STACK = auto()  # (r_src, offset)     — stack[sp + offset] = r_src
+    CALL        = auto()  # (target,)           — push ip+1; jump to target
+    RET         = auto()  # ()                  — pop return address; jump to it
+
     PRINT      = auto()  # (r_src,)           — print the value directly
     PRINT_TEXT = auto()  # (r_src,)           — register holds a list of character
                          #                      codes; decode back to a string and print
