@@ -598,7 +598,7 @@ print b.count
 print b.label is equal to ""
 print length of b.items
 """
-        self.assertEqual(run_capture(src), "0\nTrue\n0\n")
+        self.assertEqual(run_capture(src), "0.0\nTrue\n0\n")
 
     def test_add_to_field(self):
         src = """define record Account
@@ -610,7 +610,7 @@ set a.balance to 50
 add 25 to a.balance
 print a.balance
 """
-        self.assertEqual(run_capture(src), "75\n")
+        self.assertEqual(run_capture(src), "75.0\n")
 
     def test_multiply_field(self):
         src = """define record Rect
@@ -835,7 +835,7 @@ set g[0, 0] to 5
 add 3 to g[0, 0]
 print g[0, 0]
 """
-        self.assertEqual(run_capture(src), "8\n")
+        self.assertEqual(run_capture(src), "8.0\n")
 
     def test_multiply_cell(self):
         src = """set g to empty matrix 2 by 2 of number
@@ -843,7 +843,7 @@ set g[1, 0] to 4
 multiply g[1, 0] by 3
 print g[1, 0]
 """
-        self.assertEqual(run_capture(src), "12\n")
+        self.assertEqual(run_capture(src), "12.0\n")
 
     def test_3d_matrix(self):
         src = """set cube to empty matrix 2 by 2 by 2 of number

@@ -375,7 +375,11 @@ class Compiler:
         self.emit(Opcode.APPEND, (1, 0))
 
     def compile_print(self, stmt: PrintStmt) -> None:
-        for part in stmt.parts:
+        # `print A and B and ...` is one statement → one trailing newline.
+        # Adjacent parts get a single-space separator.
+        for i, part in enumerate(stmt.parts):
+            if i > 0:
+                self.emit(Opcode.PRINT_SPACE, ())
             ty = self.compile_expr_into(part, reg=0)
             # TEXT values are arrays of char codes — use PRINT_TEXT to
             # decode them back. Everything else uses plain PRINT.
@@ -383,6 +387,7 @@ class Compiler:
                 self.emit(Opcode.PRINT_TEXT, (0,))
             else:
                 self.emit(Opcode.PRINT, (0,))
+        self.emit(Opcode.PRINT_NEWLINE, ())
 
     # ----- matrix-specific -----
 

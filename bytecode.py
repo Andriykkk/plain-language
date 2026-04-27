@@ -111,10 +111,14 @@ class Opcode(Enum):
     CALL        = auto()  # (target,)           — push ip+1; jump to target
     RET         = auto()  # ()                  — pop return address; jump to it
 
-    PRINT      = auto()  # (r_src,)           — print the value directly
-    PRINT_TEXT = auto()  # (r_src,)           — register holds a list of character
-                         #                      codes; decode back to a string and print
-    HALT       = auto()
+    # Print ops don't add their own newline. `compile_print` emits one
+    # `PRINT_NEWLINE` after the last part of a `print A and B and ...`
+    # statement, and `PRINT_SPACE` between adjacent parts.
+    PRINT         = auto()  # (r_src,)        — write str(value), no newline
+    PRINT_TEXT    = auto()  # (r_src,)        — decode a list of char codes and write
+    PRINT_SPACE   = auto()  # ()              — write a single space
+    PRINT_NEWLINE = auto()  # ()              — write a single '\n'
+    HALT          = auto()
 
 
 @dataclass

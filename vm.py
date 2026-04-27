@@ -6,6 +6,8 @@ to MEMORY_SIZE with None for future growth). A small pool of scratch
 registers. A single IP that walks the code list.
 """
 
+import sys
+
 from bytecode import Module, Opcode
 
 
@@ -239,13 +241,19 @@ def execute(module: Module) -> None:
 
         elif op is Opcode.PRINT:
             (r_src,) = operands
-            print(registers[r_src])
+            sys.stdout.write(str(registers[r_src]))
 
         elif op is Opcode.PRINT_TEXT:
             (r_src,) = operands
-            # Register holds an array of character codes — decode and print.
+            # Register holds an array of character codes — decode and write.
             chars = registers[r_src]
-            print("".join(chr(c) for c in chars))
+            sys.stdout.write("".join(chr(c) for c in chars))
+
+        elif op is Opcode.PRINT_SPACE:
+            sys.stdout.write(" ")
+
+        elif op is Opcode.PRINT_NEWLINE:
+            sys.stdout.write("\n")
 
         elif op is Opcode.HALT:
             return
