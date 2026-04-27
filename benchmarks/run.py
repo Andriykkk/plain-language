@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lexer import tokenize
 from parser import Parser
-from evaluator import execute_program
+from compiler import compile_program
+from vm import execute
 
 
 # ---------- timing helpers ----------
@@ -26,12 +27,16 @@ def _find_c_compiler() -> str | None:
 
 
 def time_plainlang(source: str) -> float:
+    """Measures execution time only — parsing and compilation are done
+    up-front and excluded, matching how the language would be used in
+    practice (compile once, run many times)."""
     tokens = tokenize(source)
     stmts = Parser(source, tokens).parse_program()
+    module = compile_program(stmts)
     buf = StringIO()
     start = time.perf_counter()
     with redirect_stdout(buf):
-        execute_program(stmts)
+        execute(module)
     return time.perf_counter() - start
 
 
@@ -91,8 +96,8 @@ FIB_N = 22
 
 FIB_PLAIN = f"""
 define function fib
-    input n as number
-    output as number
+    input n as i64
+    output as i64
 
     if n is less than 2
         return n
@@ -129,7 +134,7 @@ int main(void) {{
 LIST_BUILD_N = 20_000
 
 LIST_BUILD_PLAIN = f"""
-set xs to empty list of number
+set xs to empty list of i64
 repeat for i from 1 to {LIST_BUILD_N}
     append i to xs
 end
@@ -169,7 +174,7 @@ BUBBLE_N = 200
 
 BUBBLE_PLAIN = f"""
 set n to {BUBBLE_N}
-set arr to empty list of number
+set arr to empty list of i64
 
 set v to n
 repeat n times
@@ -187,7 +192,7 @@ repeat for i from 1 to n
     end
 end
 
-print arr[0] and arr[n minus 1]
+print arr[0], arr[n minus 1]
 """
 
 BUBBLE_PYTHON = f"""
@@ -225,7 +230,7 @@ SIEVE_N = 10_000
 SIEVE_PLAIN = f"""
 set n to {SIEVE_N}
 # is_prime has length n+1; index k represents the number k
-set is_prime to empty list of number
+set is_prime to empty list of i64
 repeat n plus 1 times
     append 1 to is_prime
 end
