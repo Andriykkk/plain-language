@@ -1,8 +1,10 @@
 [ ] add list initialisation
+[ ] make better functions input and output
 [ ] add slow and dynamic value
 [ ] add debuger and parser to show what types during coding
 [ ] add separate functions to compare lists, matrices, fill them, etc
 [ ] add divide everything for matrix and lists
+[ ] add more types https://www.youtube.com/watch?v=X40rcpLfMdY&list=WL&index=3&pp=iAQBsAgC
 [ ] add array of structures or structure of arrays to choose when allocate
 [ ] add machine learning to predict result of the code to choose best optimisation
 [ ] rows of / columns of only make sense for 2D+. For 3D+, you'd want size of m at dimension N or a shape of m returning a list. Leaving for when you actually need it.

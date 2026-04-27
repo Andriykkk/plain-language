@@ -404,7 +404,7 @@ end
 
 print call add3 with 1 and 2 and 3
 """
-        self.assertEqual(run_capture(src), "6\n")
+        self.assertEqual(run_capture(src), "6.0\n")
 
     def test_call_as_statement_for_side_effects(self):
         src = """define function greet
@@ -449,7 +449,7 @@ end
 
 print call square_plus_one with 4
 """
-        self.assertEqual(run_capture(src), "17\n")
+        self.assertEqual(run_capture(src), "17.0\n")
 
     def test_bare_return_gives_none(self):
         src = """define function nothing

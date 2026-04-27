@@ -196,20 +196,53 @@ class Compiler:
         # lazily on first function-related code; functions store their result
         # here on RET, callers LOAD it after CALL.
         self.return_slot_addr: int | None = None
+        # Forward calls — compile_call records (instr_idx, function_name) here
+        # whenever it emits a CALL whose target hasn't been compiled yet.
+        # Patched at the end of compile_program once every body's entry is
+        # known.
+        self.pending_call_patches: list[tuple[int, str]] = []
 
     # ----- entry -----
 
     def compile_program(self, stmts: list[Stmt]) -> Module:
-        # Source order is preserved. FunctionDefs emit their bodies inline,
-        # wrapped in a JMP that jumps past the body so straight-line
-        # execution doesn't fall into it. Functions self-recurse fine
-        # (registered before their body is compiled), but mutual recursion
-        # and forward calls require the callee to be defined first.
+        # Pre-pass: register every top-level function name with a placeholder
+        # entry of -1. Bodies are compiled in source order; when a body emits
+        # a CALL to a function whose body hasn't been compiled yet, the CALL
+        # uses the -1 placeholder and is recorded in pending_call_patches.
+        # Patches are applied at the end once every entry is known.
+        # This is what enables forward references and mutual recursion.
+        for stmt in stmts:
+            if isinstance(stmt, FunctionDef):
+                self._predeclare_function(stmt)
+
         self.module.entry = 0
         for stmt in stmts:
             self.compile_stmt(stmt)
         self.emit(Opcode.HALT, ())
+
+        for instr_idx, fname in self.pending_call_patches:
+            entry = self.functions[fname].entry
+            if entry == -1:
+                raise CompileError(
+                    f"function {fname!r} was declared but never defined"
+                )
+            old = self.module.code[instr_idx]
+            self.module.code[instr_idx] = Instruction(old.op, (entry,), old.line)
+
         return self.module
+
+    def _predeclare_function(self, fd: FunctionDef) -> None:
+        if fd.name in self.functions:
+            raise CompileError(f"function {fd.name!r} defined twice")
+        params: list[tuple[str, TypeCode]] = []
+        for pname, ptype in fd.params:
+            params.append((pname, self.typeref_to_elem_code(ptype)))
+        return_type = (
+            self.typeref_to_code(fd.return_type) if fd.return_type is not None else None
+        )
+        self.functions[fd.name] = FunctionInfo(
+            name=fd.name, entry=-1, params=params, return_type=return_type,
+        )
 
     # ----- stack-tracking emission helpers -----
 
@@ -1031,39 +1064,32 @@ class Compiler:
     # is loaded into a register or pushed before any further code runs).
 
     def compile_function_def(self, fd: FunctionDef) -> None:
-        if fd.name in self.functions:
-            raise CompileError(f"function {fd.name!r} defined twice")
         if self.current_func is not None:
             raise CompileError(
                 "nested function definitions aren't supported"
             )
-
-        params: list[tuple[str, TypeCode]] = []
-        for pname, ptype in fd.params:
-            params.append((pname, self.typeref_to_elem_code(ptype)))
-        return_type = (
-            self.typeref_to_code(fd.return_type) if fd.return_type is not None else None
-        )
+        # The pre-pass in compile_program registered this function with
+        # entry = -1; here we fill in the real entry once the body's
+        # position is known. If we got here without a pre-registration,
+        # this is a nested FunctionDef — caught above.
+        if fd.name not in self.functions:
+            self._predeclare_function(fd)
+        info = self.functions[fd.name]
+        if info.entry != -1:
+            raise CompileError(f"function {fd.name!r} defined twice")
 
         # Functions are emitted inline in source order, so we need to jump
         # over the body at runtime — otherwise straight-line execution from
         # the surrounding code would fall right into it.
         skip_idx = self.emit_placeholder_jump(Opcode.JMP)
 
-        info = FunctionInfo(
-            name=fd.name,
-            entry=self.current_pos(),
-            params=params,
-            return_type=return_type,
-        )
-        # Register before the body so the function can call itself.
-        self.functions[fd.name] = info
+        info.entry = self.current_pos()
 
         prev_func, prev_indices, prev_delta = (
             self.current_func, self.param_indices, self.stack_delta
         )
         self.current_func = info
-        self.param_indices = {name: i for i, (name, _) in enumerate(params)}
+        self.param_indices = {name: i for i, (name, _) in enumerate(info.params)}
         self.stack_delta = 0
 
         for s in fd.body:
@@ -1104,7 +1130,14 @@ class Compiler:
                     )
             self.emit_push(0)
 
+        # If the callee's body hasn't been compiled yet, we don't know its
+        # entry. Emit CALL with a placeholder and remember the instruction
+        # index so compile_program can patch it after every body is laid
+        # out.
+        call_idx = self.current_pos()
         self.emit(Opcode.CALL, (info.entry,))
+        if info.entry == -1:
+            self.pending_call_patches.append((call_idx, ce.name))
 
         # Pick up the result from the shared return slot, then drop the args.
         ret_slot = self._ensure_return_slot()
