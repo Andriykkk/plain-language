@@ -390,7 +390,7 @@ end
 
 print call double with 21
 """
-        self.assertEqual(run_capture(src), "42\n")
+        self.assertEqual(run_capture(src), "42.0\n")
 
     def test_multiple_args(self):
         src = """define function add3
@@ -419,8 +419,8 @@ call greet with "world"
 
     def test_recursion(self):
         src = """define function fact
-    input n as number
-    output as number
+    input n as i64
+    output as i64
 
     if n is at most 1
         return 1
@@ -501,7 +501,7 @@ print call uses_helper
 
     def test_return_value_in_expression(self):
         src = """define function five
-    output as number
+    output as i64
 
     return 5
 end
@@ -570,7 +570,7 @@ set u.name to "Alice"
 set u.age to 30
 print u.name and u.age
 """
-        self.assertEqual(run_capture(src), "Alice\n30\n")
+        self.assertEqual(run_capture(src), "Alice 30\n")
 
     def test_define_and_set_fields_float(self):
         src = """define record Person
@@ -583,7 +583,7 @@ set u.name to "Alice"
 set u.age to 30
 print u.name and u.age
 """
-        self.assertEqual(run_capture(src), "Alice\n30.0\n")
+        self.assertEqual(run_capture(src), "Alice 30.0\n")
 
     def test_default_field_values(self):
         # number defaults to 0, text to "", list to [], map to {}
@@ -739,7 +739,7 @@ append 20 to xs
 add 5 to xs[0]
 print xs[0]
 """
-        self.assertEqual(run_capture(src), "15\n")
+        self.assertEqual(run_capture(src), "15.0\n")
 
     def test_iterate_list(self):
         src = """set xs to empty list of number

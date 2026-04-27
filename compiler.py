@@ -282,6 +282,7 @@ class Compiler:
         # ----- set xs[i] to value  (1D)  -----
         # ----- set m[i, j] to value (2D matrix) -----
         if isinstance(target, IndexLValue):
+            self._check_index_arity(target.obj, len(target.indices))
             if len(target.indices) == 1:
                 # Compile value FIRST into r0. If the value expression is
                 # itself indexed (e.g. s[1] = s[4]), it uses r1..r_N as scratch;
@@ -611,6 +612,22 @@ class Compiler:
             raise CompileError(f"{expr.name!r} is not a matrix")
         return self.module.symbol_shapes[expr.name]
 
+    def _check_index_arity(self, obj_expr, n_indices: int) -> None:
+        """If `obj_expr` is a known matrix variable, enforce that the
+        number of indices matches its declared dimensionality. Plain lists
+        and unknown expressions are unconstrained — only matrices have a
+        compile-time-known shape."""
+        if not isinstance(obj_expr, VarRef):
+            return
+        shape = self.module.symbol_shapes.get(obj_expr.name)
+        if shape is None:
+            return
+        if len(shape) != n_indices:
+            raise CompileError(
+                f"{obj_expr.name!r} is a {len(shape)}-dimensional matrix; "
+                f"indexing with {n_indices} index(es) is invalid"
+            )
+
     def _contains_call(self, expr) -> bool:
         """True if evaluating `expr` could emit a CALL — meaning all
         registers might be clobbered. Used to decide when a parent
@@ -705,6 +722,7 @@ class Compiler:
             return TypeCode.REF
 
         if isinstance(expr, IndexAccess):
+            self._check_index_arity(expr.obj, len(expr.indices))
             if len(expr.indices) == 1:
                 self.compile_expr_into(expr.obj, reg + 1)
                 idx_type = self.compile_expr_into(expr.indices[0], reg + 2)
