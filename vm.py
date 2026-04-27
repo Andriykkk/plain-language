@@ -123,12 +123,23 @@ def execute(module: Module) -> None:
             r_dst, r_ptr, r_off = operands
             block = registers[r_ptr]
             off = registers[r_off]
+            # Bounds check at the VM boundary — Python's IndexError isn't a
+            # VMError, so the test harness wouldn't recognize it as a clean
+            # runtime failure.
+            if off < 0 or off >= len(block):
+                raise VMError(
+                    f"index {off} out of range for container of length {len(block)}"
+                )
             registers[r_dst] = block[off]
 
         elif op is Opcode.STORE_AT:
             r_src, r_ptr, r_off = operands
             block = registers[r_ptr]
             off = registers[r_off]
+            if off < 0 or off >= len(block):
+                raise VMError(
+                    f"index {off} out of range for container of length {len(block)}"
+                )
             block[off] = registers[r_src]
 
         elif op is Opcode.APPEND:

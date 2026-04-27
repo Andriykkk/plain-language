@@ -405,7 +405,15 @@ class Compiler:
         # append <value> to <list>
         # r0 = value, r1 = list pointer; APPEND r1, r0.
         self.compile_expr_into(stmt.value, reg=0)
-        self.compile_expr_into_lvalue(stmt.target, reg=1)
+        target_type = self.compile_expr_into_lvalue(stmt.target, reg=1)
+        # Variable types are fixed at declaration, so a non-REF target can
+        # never legitimately become a list — reject at compile time rather
+        # than letting the VM trip on calling .append() on a scalar.
+        if target_type != TypeCode.REF:
+            raise CompileError(
+                f"can only append to a list, not to a value of type "
+                f"{target_type.name}"
+            )
         self.emit(Opcode.APPEND, (1, 0))
 
     def compile_print(self, stmt: PrintStmt) -> None:

@@ -4,6 +4,7 @@
 [ ] add debuger and parser to show what types during coding
 [ ] add separate functions to compare lists, matrices, fill them, etc
 [ ] add divide everything for matrix and lists
+[ ] add comptime list length check, not complex, just where it possible
 [ ] add more types https://www.youtube.com/watch?v=X40rcpLfMdY&list=WL&index=3&pp=iAQBsAgC
 [ ] add array of structures or structure of arrays to choose when allocate
 [ ] add machine learning to predict result of the code to choose best optimisation
