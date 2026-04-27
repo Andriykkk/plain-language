@@ -12,7 +12,7 @@ to the common result type. Division of two integers produces F64.
 
 from dataclasses import dataclass, field
 
-from bytecode import Instruction, Module, Opcode, RecordLayout, TypeCode
+from bytecode import FieldLayout, Instruction, Module, Opcode, RecordLayout, TypeCode
 from parser import (
     AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, ColumnsExpr, Compare,
     EmptyList, EmptyMatrix, FieldAccess, FieldLValue, FunctionDef, IfStmt,
@@ -31,6 +31,29 @@ class LoopContext:
     once the loop's structure is fully emitted."""
     break_patches: list[int] = field(default_factory=list)
     continue_patches: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _ChainAccess:
+    """Result of walking a chain of FieldAccess / IndexAccess steps from
+    a root variable. The compiler can emit a single LOAD_AT/STORE_AT
+    against a base pointer plus a computed offset.
+
+    leaf_kind tells the emitter what kind of slot we'd be reading:
+      - "primitive": a scalar slot (i64, text pointer, ref, ...)
+      - "record":    the start of an inline record block (terminal for
+                      read/write — the user must chain another `.field`)
+      - "list":      the variable's value is a list pointer (terminal:
+                      must `[i]` to step in)
+      - "matrix":    same but multi-dim
+    """
+    root: str
+    static_offset: int
+    dynamic_terms: list  # list of (Expr, stride_int)
+    leaf_kind: str
+    leaf_type: "TypeCode | None" = None
+    leaf_record_name: "str | None" = None
+    matrix_shape: "tuple | None" = None
 
 
 @dataclass
@@ -308,26 +331,33 @@ class Compiler:
         if isinstance(target, VarLValue) and isinstance(stmt.value, NewExpr):
             return self.compile_set_new_record(target.name, stmt.value)
 
-        # Field assignment: `set p.field to value`.
+        # Field assignment: `set p.field to value` (chains through nested
+        # records and indexed access work via the chain walker too).
         if isinstance(target, FieldLValue):
-            return self.compile_field_assign(target, stmt.value)
+            target_expr = FieldAccess(target.obj, target.field)
+            return self.compile_chain_store(target_expr, stmt.value)
 
         # ----- set xs[i] to value  (1D)  -----
         # ----- set m[i, j] to value (2D matrix) -----
+        # ----- set xs[i].field to value, set xs[i].a.b to value, etc. -----
         if isinstance(target, IndexLValue):
-            self._check_index_arity(target.obj, len(target.indices))
-            if len(target.indices) == 1:
-                # Compile value FIRST into r0. If the value expression is
-                # itself indexed (e.g. s[1] = s[4]), it uses r1..r_N as scratch;
-                # doing it before we set up r1/r2 avoids clobbering them.
+            target_expr = IndexAccess(target.obj, target.indices)
+            # Special-case the single-character text-store: `set s[i] to "H"`
+            # for a TEXT variable folds the char to its i8 code at compile
+            # time. The chain walker would otherwise reject the type
+            # mismatch.
+            if (len(target.indices) == 1
+                    and isinstance(target.obj, VarRef)
+                    and self.module.symbol_types.get(target.obj.name) == TypeCode.TEXT
+                    and isinstance(stmt.value, StringLit)):
+                # Fold via the existing helper, which loads the i8 code
+                # into r0 and emits STORE_AT against the text array.
                 self.compile_char_or_value(target, stmt.value, reg=0)
-                self.compile_expr_into(target.obj, reg=1)         # r1 = pointer
-                self.compile_expr_into(target.indices[0], reg=2)   # r2 = index
+                self.compile_expr_into(target.obj, reg=1)
+                self.compile_expr_into(target.indices[0], reg=2)
                 self.emit(Opcode.STORE_AT, (0, 1, 2))
                 return
-            if len(target.indices) == 2:
-                return self.compile_matrix_set(target, stmt.value)
-            raise CompileError("only 1D or 2D indexing supported")
+            return self.compile_chain_store(target_expr, stmt.value)
 
         # ----- set x to value [as <type>] -----
         if isinstance(target, VarLValue):
@@ -372,6 +402,13 @@ class Compiler:
                 elem_type = self.infer_elem_type(stmt.value)
                 if elem_type is not None:
                     self.module.symbol_elem_types[target.name] = elem_type
+                # If the container's elements are records, track that too so
+                # `xs[i].field` chains can compute the right strides and
+                # field offsets. The element record name comes from the
+                # original TypeRef at the EmptyList / EmptyMatrix node.
+                elem_rec = self._infer_elem_record_name(stmt.value)
+                if elem_rec is not None:
+                    self.module.symbol_elem_record_types[target.name] = elem_rec
             self.emit(Opcode.STORE, (0, addr))
             return
 
@@ -403,18 +440,62 @@ class Compiler:
 
     def compile_append(self, stmt: AppendStmt) -> None:
         # append <value> to <list>
-        # r0 = value, r1 = list pointer; APPEND r1, r0.
+        # For lists of records, "appending a record" means appending K
+        # consecutive slots from the source record block. That's K
+        # LOAD_AT/APPEND pairs unrolled at compile time — no new opcode
+        # needed.
+        target_lv = stmt.target
+        elem_rec_name = None
+        if isinstance(target_lv, VarLValue):
+            elem_rec_name = self.module.symbol_elem_record_types.get(target_lv.name)
+
+        if elem_rec_name is not None:
+            return self._compile_append_record(stmt, elem_rec_name)
+
+        # Plain (primitive) list append.
         self.compile_expr_into(stmt.value, reg=0)
         target_type = self.compile_expr_into_lvalue(stmt.target, reg=1)
-        # Variable types are fixed at declaration, so a non-REF target can
-        # never legitimately become a list — reject at compile time rather
-        # than letting the VM trip on calling .append() on a scalar.
         if target_type != TypeCode.REF:
             raise CompileError(
                 f"can only append to a list, not to a value of type "
                 f"{target_type.name}"
             )
         self.emit(Opcode.APPEND, (1, 0))
+
+    def _compile_append_record(self, stmt: AppendStmt, elem_rec_name: str) -> None:
+        """`append <record-expr> to xs` where xs is a list-of-records.
+        Copies the K slots of the source record into the end of the list."""
+        layout = self.module.records[elem_rec_name]
+        K = layout.size
+
+        # Source: either a fresh `new Record` or a chain ending in a record.
+        # In both cases we want a (ptr, base_offset) pair to read K slots
+        # from. r2 = src ptr, r3 = src offset, r4 = scratch.
+        src_expr = stmt.value
+        if isinstance(src_expr, NewExpr):
+            self.compile_new_record_inline(src_expr, reg=2)
+            zero_addr = self.allocate_constant(0)
+            self.emit(Opcode.LOAD, (3, zero_addr))
+        else:
+            src_ca = self._walk_chain(src_expr)
+            if src_ca.leaf_kind != "record" or src_ca.leaf_record_name != elem_rec_name:
+                raise CompileError(
+                    f"cannot append value of record type "
+                    f"{src_ca.leaf_record_name!r} to a list of "
+                    f"{elem_rec_name!r}"
+                )
+            self._emit_chain_addr(src_ca, ptr_reg=2, off_reg=3, scratch=4)
+
+        # Destination: the list pointer.
+        self.compile_expr_into_lvalue(stmt.target, reg=1)
+
+        one_addr = self.allocate_constant(1)
+        for i in range(K):
+            self.emit(Opcode.LOAD_AT, (0, 2, 3))     # r0 = src[off]
+            self.emit(Opcode.APPEND, (1, 0))          # xs.append(r0)
+            if i < K - 1:
+                self.emit(Opcode.LOAD, (4, one_addr))
+                self.emit(Opcode.ADD_I64, (3, 3, 4))
 
     def compile_print(self, stmt: PrintStmt) -> None:
         # `print A and B and ...` is one statement → one trailing newline.
@@ -444,7 +525,16 @@ class Compiler:
         if len(shape) != 2:
             raise CompileError("only 2D matrices supported in v1")
 
-        total = shape[0] * shape[1]
+        # If the elements are records, allocate enough room for `cells * K`
+        # slots so that record bodies sit packed inline.
+        elem_rec_name = (
+            em.elem_type.name
+            if em.elem_type.name in self.module.records else None
+        )
+        elem_size = (
+            self.module.records[elem_rec_name].size if elem_rec_name else 1
+        )
+        total = shape[0] * shape[1] * elem_size
         self.emit(Opcode.ALLOC, (0, total))
 
         if name in self.module.symbol_table:
@@ -457,6 +547,8 @@ class Compiler:
         # Shape and element type — purely compile-time metadata.
         self.module.symbol_shapes[name] = tuple(shape)
         self.module.symbol_elem_types[name] = self.typeref_to_elem_code(em.elem_type)
+        if elem_rec_name is not None:
+            self.module.symbol_elem_record_types[name] = elem_rec_name
         self.emit(Opcode.STORE, (0, addr))
 
     def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
@@ -514,43 +606,59 @@ class Compiler:
     # tag — the compiler tracks each record variable's type statically.
 
     def compile_record_def(self, stmt: RecordDef) -> None:
-        """Compile-time only: store the record's layout in the module so
-        later field-accesses can look up offsets and types."""
-        fields: list[tuple[str, TypeCode]] = []
+        """Compile-time only. Builds a layout where each field carries its
+        own offset and size in slots: primitives + text + ref take 1, and
+        a nested record field takes the full size of that record (stored
+        inline). Total record size is the sum. Records may only contain
+        records that were defined earlier — recursion would mean infinite
+        size and is rejected. The VM doesn't see any of this; it just gets
+        LOAD_AT instructions with the offsets the compiler computed."""
+        fields: list[FieldLayout] = []
+        offset = 0
         for field_name, type_ref in stmt.fields:
-            fields.append((field_name, self.typeref_to_elem_code(type_ref)))
+            if type_ref.name in PRIMITIVE_TYPES:
+                ftype = PRIMITIVE_TYPES[type_ref.name]
+                fsize = 1
+                rec_name: str | None = None
+            elif type_ref.name in self.module.records:
+                inner = self.module.records[type_ref.name]
+                # Marker REF in `type` plus record_name carries the meaning
+                # ("there's an inline record here"). The compiler's chain
+                # walker uses record_name; the bare TypeCode is just a tag.
+                ftype = TypeCode.REF
+                fsize = inner.size
+                rec_name = inner.name
+            elif type_ref.name == stmt.name:
+                raise CompileError(
+                    f"record {stmt.name!r} cannot directly contain itself"
+                )
+            else:
+                # Unknown primitive and unknown record — treat as opaque REF
+                # (matches the previous typeref_to_elem_code fallback so
+                # custom field types like `as MyEnum` don't error here).
+                ftype = TypeCode.REF
+                fsize = 1
+                rec_name = None
+            fields.append(FieldLayout(
+                name=field_name, type=ftype, offset=offset,
+                size=fsize, record_name=rec_name,
+            ))
+            offset += fsize
         self.module.records[stmt.name] = RecordLayout(stmt.name, fields)
 
     def compile_set_new_record(self, name: str, new_expr: NewExpr) -> None:
-        """Allocate a fresh record block, initialize fields to their type
-        defaults, and bind the pointer to `name`."""
+        """Allocate a fresh record block, recursively initialize all leaf
+        slots (including nested-record fields stored inline), and bind the
+        pointer to `name`."""
         record_name = new_expr.type_name
         if record_name not in self.module.records:
             raise CompileError(f"unknown record type {record_name!r}")
         layout = self.module.records[record_name]
-        size = len(layout.fields)
 
-        # r0 = new record block (size slots, all initially None from ALLOC)
-        self.emit(Opcode.ALLOC, (0, size))
-
-        # Initialize each field to its type's default value. The VM's ALLOC
-        # zero-fills with None; for non-reference fields we overwrite with
-        # the type's natural zero (0, 0.0, False). For TEXT/REF fields we
-        # allocate a fresh empty array so `length of record.field` returns
-        # 0 instead of erroring on None.
-        for i, (_field_name, field_type) in enumerate(layout.fields):
-            offset_addr = self.allocate_constant(i)
-            self.emit(Opcode.LOAD, (2, offset_addr))
-
-            if field_type == TypeCode.TEXT or field_type == TypeCode.REF:
-                # Fresh empty array for each field — avoids shared state.
-                self.emit(Opcode.ALLOC, (1, 0))
-            else:
-                default = self._default_for_field(field_type)
-                default_addr = self.allocate_constant(default)
-                self.emit(Opcode.LOAD, (1, default_addr))
-
-            self.emit(Opcode.STORE_AT, (1, 0, 2))
+        # r0 = new record block (record.size slots, ALLOC zero-fills)
+        self.emit(Opcode.ALLOC, (0, layout.size))
+        self._init_record_at(ptr_reg=0, layout=layout, base_offset=0,
+                             scratch_val=1, scratch_off=2)
 
         # Bind the record pointer to the variable and remember its type.
         if name in self.module.symbol_table:
@@ -564,76 +672,282 @@ class Compiler:
 
     def compile_new_record_inline(self, new_expr: NewExpr, reg: int) -> TypeCode:
         """`new Person` used inside an expression (not on the right side of
-        `set`). Same ALLOC + default-init, but we can't attach a record
-        type to any variable since there's no target here."""
+        `set`). Same ALLOC + recursive init, but the record-name binding has
+        no variable to attach to — the caller is expected to either chain
+        a field access (won't currently work without a binding) or copy the
+        block into a list slot via `append`."""
         record_name = new_expr.type_name
         if record_name not in self.module.records:
             raise CompileError(f"unknown record type {record_name!r}")
         layout = self.module.records[record_name]
-        size = len(layout.fields)
 
-        self.emit(Opcode.ALLOC, (reg, size))
-        for i, (_field_name, field_type) in enumerate(layout.fields):
-            offset_addr = self.allocate_constant(i)
-            self.emit(Opcode.LOAD, (reg + 2, offset_addr))
-            if field_type == TypeCode.TEXT or field_type == TypeCode.REF:
-                self.emit(Opcode.ALLOC, (reg + 1, 0))
-            else:
-                default = self._default_for_field(field_type)
-                default_addr = self.allocate_constant(default)
-                self.emit(Opcode.LOAD, (reg + 1, default_addr))
-            self.emit(Opcode.STORE_AT, (reg + 1, reg, reg + 2))
+        self.emit(Opcode.ALLOC, (reg, layout.size))
+        self._init_record_at(ptr_reg=reg, layout=layout, base_offset=0,
+                             scratch_val=reg + 1, scratch_off=reg + 2)
         return TypeCode.REF
 
-    def compile_field_access(self, expr: FieldAccess, reg: int) -> TypeCode:
-        """Read a field: LOAD record pointer, LOAD offset, LOAD_AT."""
-        layout, offset, field_type = self._resolve_field(expr.obj, expr.field)
-        # Load pointer into reg+1
-        self.compile_expr_into(expr.obj, reg + 1)
-        # Load offset constant into reg+2
-        offset_addr = self.allocate_constant(offset)
-        self.emit(Opcode.LOAD, (reg + 2, offset_addr))
-        # Deref: reg = (*ptr)[offset]
+    def _init_record_at(self, ptr_reg: int, layout: RecordLayout,
+                        base_offset: int, scratch_val: int,
+                        scratch_off: int) -> None:
+        """Fill in default values for every leaf slot of a record block at
+        (ptr_reg, base_offset). Walks nested records recursively so each
+        primitive slot gets its zero, each TEXT/REF slot gets a fresh empty
+        array, and the inline sub-records' offsets are computed relative to
+        the outer block."""
+        for f in layout.fields:
+            if f.record_name is not None:
+                inner = self.module.records[f.record_name]
+                self._init_record_at(
+                    ptr_reg=ptr_reg, layout=inner,
+                    base_offset=base_offset + f.offset,
+                    scratch_val=scratch_val, scratch_off=scratch_off,
+                )
+                continue
+            slot_offset = base_offset + f.offset
+            offset_addr = self.allocate_constant(slot_offset)
+            self.emit(Opcode.LOAD, (scratch_off, offset_addr))
+            if f.type == TypeCode.TEXT or f.type == TypeCode.REF:
+                # Fresh empty array per field so each instance has its own
+                # backing store.
+                self.emit(Opcode.ALLOC, (scratch_val, 0))
+            else:
+                default = self._default_for_field(f.type)
+                default_addr = self.allocate_constant(default)
+                self.emit(Opcode.LOAD, (scratch_val, default_addr))
+            self.emit(Opcode.STORE_AT, (scratch_val, ptr_reg, scratch_off))
+
+    # --- chain access (a.b.c, xs[i].field, g[i,j].field, etc.) ---
+
+    def _walk_chain(self, expr) -> _ChainAccess:
+        """Recursively walk an access chain (VarRef root + sequence of
+        FieldAccess / IndexAccess steps), accumulating static field offsets
+        and dynamic index*stride terms. Multi-pointer chains (e.g. a list
+        nested inside a record) aren't handled — they'd require breaking
+        into multiple LOAD_AT phases. Errors out clearly when it hits one.
+        """
+        if isinstance(expr, VarRef):
+            name = expr.name
+            # Parameters live on the value stack, not in main memory; chain
+            # access through a parameter would need an entirely different
+            # base-pointer story. Reject for now.
+            if self.current_func is not None and name in self.param_indices:
+                raise CompileError(
+                    f"chain access through parameter {name!r} isn't supported yet"
+                )
+            if name not in self.module.symbol_table:
+                raise CompileError(f"undeclared variable {name!r}")
+
+            rec_name = self.module.symbol_record_types.get(name)
+            if rec_name is not None:
+                return _ChainAccess(
+                    root=name, static_offset=0, dynamic_terms=[],
+                    leaf_kind="record", leaf_record_name=rec_name,
+                )
+            shape = self.module.symbol_shapes.get(name)
+            if shape is not None:
+                return _ChainAccess(
+                    root=name, static_offset=0, dynamic_terms=[],
+                    leaf_kind="matrix",
+                    leaf_type=self.module.symbol_elem_types.get(name, TypeCode.REF),
+                    leaf_record_name=self.module.symbol_elem_record_types.get(name),
+                    matrix_shape=shape,
+                )
+            if name in self.module.symbol_elem_types or \
+               name in self.module.symbol_elem_record_types:
+                return _ChainAccess(
+                    root=name, static_offset=0, dynamic_terms=[],
+                    leaf_kind="list",
+                    leaf_type=self.module.symbol_elem_types.get(name, TypeCode.REF),
+                    leaf_record_name=self.module.symbol_elem_record_types.get(name),
+                )
+            # Plain primitive variable.
+            return _ChainAccess(
+                root=name, static_offset=0, dynamic_terms=[],
+                leaf_kind="primitive",
+                leaf_type=self.module.symbol_types[name],
+            )
+
+        if isinstance(expr, FieldAccess):
+            ca = self._walk_chain(expr.obj)
+            if ca.leaf_kind != "record" or ca.leaf_record_name is None:
+                raise CompileError(
+                    f"field access on a non-record (chain leaf is {ca.leaf_kind})"
+                )
+            layout = self.module.records[ca.leaf_record_name]
+            f = layout.find(expr.field)
+            if f is None:
+                raise CompileError(
+                    f"record {ca.leaf_record_name!r} has no field {expr.field!r}"
+                )
+            ca.static_offset += f.offset
+            if f.record_name is not None:
+                ca.leaf_kind = "record"
+                ca.leaf_record_name = f.record_name
+                ca.leaf_type = None
+            else:
+                ca.leaf_kind = "primitive"
+                ca.leaf_type = f.type
+                ca.leaf_record_name = None
+            return ca
+
+        if isinstance(expr, IndexAccess):
+            ca = self._walk_chain(expr.obj)
+            if ca.leaf_kind == "list":
+                if len(expr.indices) != 1:
+                    raise CompileError("expected one index for a list")
+                stride = (
+                    self.module.records[ca.leaf_record_name].size
+                    if ca.leaf_record_name else 1
+                )
+                ca.dynamic_terms.append((expr.indices[0], stride))
+            elif ca.leaf_kind == "matrix":
+                if len(expr.indices) != len(ca.matrix_shape):
+                    raise CompileError(
+                        f"matrix has {len(ca.matrix_shape)} dimensions; "
+                        f"got {len(expr.indices)} index(es)"
+                    )
+                stride = (
+                    self.module.records[ca.leaf_record_name].size
+                    if ca.leaf_record_name else 1
+                )
+                # row-major: outermost dim has the largest stride
+                trailing = stride
+                strides = []
+                for dim in reversed(ca.matrix_shape):
+                    strides.append(trailing)
+                    trailing *= dim
+                strides.reverse()  # now strides[i] is the stride for dim i
+                for idx_expr, s in zip(expr.indices, strides):
+                    ca.dynamic_terms.append((idx_expr, s))
+            else:
+                raise CompileError(
+                    f"cannot index a {ca.leaf_kind} (expected list or matrix)"
+                )
+            # After indexing, the leaf becomes the element type.
+            if ca.leaf_record_name is not None:
+                ca.leaf_kind = "record"
+                # leaf_record_name already set
+            else:
+                ca.leaf_kind = "primitive"
+                # leaf_type already set
+            ca.matrix_shape = None
+            return ca
+
+        raise CompileError(
+            f"unsupported expression in access chain: {type(expr).__name__}"
+        )
+
+    def _emit_chain_addr(self, ca: "_ChainAccess",
+                         ptr_reg: int, off_reg: int, scratch: int) -> None:
+        """Materialize the pointer in `ptr_reg` and the slot offset in
+        `off_reg`. `scratch` and `scratch+1` are used for index*stride math.
+        Caller must ensure these registers don't collide with anything live.
+        """
+        addr = self.module.symbol_table[ca.root]
+        self.emit(Opcode.LOAD, (ptr_reg, addr))
+
+        static_addr = self.allocate_constant(ca.static_offset)
+        self.emit(Opcode.LOAD, (off_reg, static_addr))
+
+        for idx_expr, stride in ca.dynamic_terms:
+            idx_type = self.compile_expr_into(idx_expr, scratch)
+            self.coerce(idx_type, TypeCode.I64, scratch)
+            if stride != 1:
+                stride_addr = self.allocate_constant(stride)
+                self.emit(Opcode.LOAD, (scratch + 1, stride_addr))
+                self.emit(Opcode.MUL_I64, (scratch, scratch, scratch + 1))
+            self.emit(Opcode.ADD_I64, (off_reg, off_reg, scratch))
+
+    def compile_chain_load(self, expr, reg: int) -> TypeCode:
+        """Read the leaf slot of an access chain into `reg`."""
+        ca = self._walk_chain(expr)
+        if ca.leaf_kind == "record":
+            raise CompileError(
+                f"cannot read whole record by value; access a field instead"
+            )
+        if ca.leaf_kind in ("list", "matrix"):
+            # Falling back to `LOAD root_addr` would be a plain pointer copy;
+            # only happens if someone walks a bare VarRef of a list through
+            # this path, which the caller shouldn't do — IndexAccess routes
+            # here, but a bare list VarRef goes through compile_expr_into's
+            # VarRef branch.
+            raise CompileError(
+                f"cannot read {ca.leaf_kind} as a value; index or chain into it"
+            )
+        self._emit_chain_addr(ca, ptr_reg=reg + 1, off_reg=reg + 2, scratch=reg + 3)
         self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
-        return field_type
+        return ca.leaf_type or TypeCode.REF
 
-    def compile_field_assign(self, target: FieldLValue, value_expr) -> None:
-        """Write a field: compile value, LOAD record pointer, LOAD offset, STORE_AT."""
-        layout, offset, field_type = self._resolve_field(target.obj, target.field)
+    def compile_chain_store(self, target_expr, value_expr) -> None:
+        """Compile a write to the leaf slot of an access chain."""
+        ca = self._walk_chain(target_expr)
 
-        # Compile value FIRST into r0 (before setting up r1/r2 — the value
-        # expression may itself use r1+ as scratch).
+        # Whole-record assignment unrolls into K LOAD_AT/STORE_AT pairs —
+        # supported for the source patterns we actually need (a record
+        # variable, or another chain ending in a record). For now, only
+        # handle the common case `set xs[i] to p` / `set p.home to other`.
+        if ca.leaf_kind == "record":
+            return self._compile_record_copy(ca, value_expr)
+        if ca.leaf_kind in ("list", "matrix"):
+            raise CompileError(
+                f"cannot assign whole {ca.leaf_kind}; assign into a slot or "
+                f"a field"
+            )
+
+        # Compile value FIRST into r0 — its computation may use r1+ as
+        # scratch, and we don't want to clobber the pointer/offset we set
+        # up next.
         value_type = self.compile_expr_into(value_expr, reg=0)
+        if ca.leaf_type is not None and value_type != ca.leaf_type:
+            if value_type in NUMERIC_TYPES and ca.leaf_type in NUMERIC_TYPES:
+                self.emit_convert(value_type, ca.leaf_type, src=0, dst=0)
 
-        # If the value is a single-char string literal and the field is
-        # (conceptually) a character, fold to the code. But we don't track
-        # that distinction for record fields yet; for now allow mismatched
-        # numeric types via coercion and leave non-numeric mismatches as
-        # runtime responsibility.
-        if value_type != field_type \
-           and value_type in NUMERIC_TYPES \
-           and field_type in NUMERIC_TYPES:
-            self.emit_convert(value_type, field_type, src=0, dst=0)
-
-        # Set up pointer and offset, then STORE_AT.
-        self.compile_expr_into(target.obj, reg=1)
-        offset_addr = self.allocate_constant(offset)
-        self.emit(Opcode.LOAD, (2, offset_addr))
+        self._emit_chain_addr(ca, ptr_reg=1, off_reg=2, scratch=3)
         self.emit(Opcode.STORE_AT, (0, 1, 2))
 
-    def _resolve_field(self, obj_expr, field_name: str) -> tuple[RecordLayout, int, TypeCode]:
-        """Given a record-typed expression and a field name, return the
-        record's layout, the field's offset, and the field's type."""
-        if not isinstance(obj_expr, VarRef):
-            raise CompileError("field access requires a direct variable reference")
-        if obj_expr.name not in self.module.symbol_record_types:
-            raise CompileError(f"{obj_expr.name!r} is not a record")
-        record_name = self.module.symbol_record_types[obj_expr.name]
-        layout = self.module.records[record_name]
-        for i, (fname, ftype) in enumerate(layout.fields):
-            if fname == field_name:
-                return layout, i, ftype
-        raise CompileError(f"record {record_name!r} has no field {field_name!r}")
+    def _compile_record_copy(self, dst_ca: "_ChainAccess", src_expr) -> None:
+        """Whole-record assignment, unrolled at compile time. The destination
+        is an inline record slot reached via `dst_ca`; the source must be a
+        chain that also ends at an inline record (or a `new Record` block)
+        of the same record type. We do K LOAD_AT/STORE_AT pairs."""
+        dst_record = dst_ca.leaf_record_name
+        layout = self.module.records[dst_record]
+        K = layout.size
+
+        # Compile the source into a (ptr_reg, off_reg). The source can be a
+        # chain ending in an inline record, OR a fresh `new Record` block
+        # whose pointer lives in some register — in both cases what we need
+        # is "where do K consecutive slots live."
+        if isinstance(src_expr, NewExpr):
+            # Allocate the new record into r1, with no offset.
+            self.compile_new_record_inline(src_expr, reg=1)
+            zero_addr = self.allocate_constant(0)
+            self.emit(Opcode.LOAD, (2, zero_addr))
+        else:
+            src_ca = self._walk_chain(src_expr)
+            if src_ca.leaf_kind != "record" or src_ca.leaf_record_name != dst_record:
+                raise CompileError(
+                    f"cannot assign value of record type "
+                    f"{src_ca.leaf_record_name!r} to a slot of type "
+                    f"{dst_record!r}"
+                )
+            self._emit_chain_addr(src_ca, ptr_reg=1, off_reg=2, scratch=3)
+
+        # Materialize destination ptr and base offset.
+        self._emit_chain_addr(dst_ca, ptr_reg=4, off_reg=5, scratch=6)
+
+        # K unrolled copies. r0 = scratch slot value. For each i in 0..K-1:
+        # off_src = src_off + i; off_dst = dst_off + i.
+        # We bump src_off and dst_off in-place (cheaper than recomputing
+        # from a constant each iteration).
+        one_addr = self.allocate_constant(1)
+        for i in range(K):
+            self.emit(Opcode.LOAD_AT, (0, 1, 2))     # r0 = src[off]
+            self.emit(Opcode.STORE_AT, (0, 4, 5))    # dst[off] = r0
+            if i < K - 1:
+                self.emit(Opcode.LOAD, (3, one_addr))
+                self.emit(Opcode.ADD_I64, (2, 2, 3))
+                self.emit(Opcode.ADD_I64, (5, 5, 3))
 
     def _default_for_field(self, ty: TypeCode) -> object:
         """Natural zero for a primitive field type (used to default-init
@@ -763,19 +1077,10 @@ class Compiler:
             return TypeCode.REF
 
         if isinstance(expr, IndexAccess):
-            self._check_index_arity(expr.obj, len(expr.indices))
-            if len(expr.indices) == 1:
-                self.compile_expr_into(expr.obj, reg + 1)
-                idx_type = self.compile_expr_into(expr.indices[0], reg + 2)
-                self.coerce(idx_type, TypeCode.I64, reg + 2)
-                self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
-                return self._elem_type_of(expr.obj)
-            if len(expr.indices) == 2:
-                return self.compile_matrix_get(expr, reg)
-            raise CompileError("only 1D or 2D indexing supported")
+            return self.compile_chain_load(expr, reg)
 
         if isinstance(expr, FieldAccess):
-            return self.compile_field_access(expr, reg)
+            return self.compile_chain_load(expr, reg)
 
         if isinstance(expr, NewExpr):
             # Bare `new Person` in an expression context (e.g. inside a
@@ -787,6 +1092,21 @@ class Compiler:
         if isinstance(expr, LengthExpr):
             self.compile_expr_into(expr.value, reg + 1)
             self.emit(Opcode.LEN, (reg, reg + 1))
+            # If the container holds records, the raw slot count is N*K.
+            # Divide by K so the user sees the record count.
+            elem_rec = None
+            if isinstance(expr.value, VarRef):
+                elem_rec = self.module.symbol_elem_record_types.get(expr.value.name)
+            if elem_rec is not None:
+                K = self.module.records[elem_rec].size
+                if K > 1:
+                    k_addr = self.allocate_constant(K)
+                    self.emit(Opcode.LOAD, (reg + 1, k_addr))
+                    # No integer-divide opcode yet; route through F64.
+                    self.emit_convert(TypeCode.I64, TypeCode.F64, src=reg, dst=reg)
+                    self.emit_convert(TypeCode.I64, TypeCode.F64, src=reg + 1, dst=reg + 1)
+                    self.emit(Opcode.DIV_F64, (reg, reg, reg + 1))
+                    self.emit_convert(TypeCode.F64, TypeCode.I64, src=reg, dst=reg)
             return TypeCode.I64
 
         if isinstance(expr, RowsExpr):
@@ -1237,6 +1557,21 @@ class Compiler:
         if type_ref.name in PRIMITIVE_TYPES:
             return PRIMITIVE_TYPES[type_ref.name]
         return TypeCode.REF
+
+    def _infer_elem_record_name(self, expr) -> str | None:
+        """If `expr` produces a list/matrix whose elements are a known
+        record type, return that record's name. Otherwise None."""
+        if isinstance(expr, EmptyList):
+            tname = expr.elem_type.name
+            if tname in self.module.records:
+                return tname
+        if isinstance(expr, EmptyMatrix):
+            tname = expr.elem_type.name
+            if tname in self.module.records:
+                return tname
+        if isinstance(expr, VarRef):
+            return self.module.symbol_elem_record_types.get(expr.name)
+        return None
 
     def infer_elem_type(self, expr) -> TypeCode | None:
         """For an expression that produces a container, return the type of

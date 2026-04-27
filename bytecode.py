@@ -137,17 +137,37 @@ class Instruction:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RecordLayout:
-    """Compile-time layout of a record type. Fields are listed in declaration
-    order; in this slot-based prototype each field takes one slot, so a
-    field's offset is just its index in the list. Will gain explicit byte
-    offsets + alignment when the C port arrives."""
+class FieldLayout:
+    """One field inside a record. Offsets and sizes are in slots — primitives
+    take 1 slot; nested record fields take their inner record's full size and
+    are stored inline. `record_name` is set when the field is itself a record,
+    so the compiler can keep walking the layout for chained access."""
     name: str
-    fields: list[tuple[str, "TypeCode"]]
+    type: "TypeCode"
+    offset: int
+    size: int
+    record_name: str | None = None
+
+
+@dataclass
+class RecordLayout:
+    """Compile-time layout of a record type. Fields hold their own pre-
+    computed offset and size; the record's total size is the sum, supporting
+    inlined nested records. The VM never sees this — it only sees flat slot
+    reads/writes — but the compiler uses it to compute every offset that
+    eventually shows up in LOAD_AT / STORE_AT instructions."""
+    name: str
+    fields: list[FieldLayout]
 
     @property
     def size(self) -> int:
-        return len(self.fields)
+        return sum(f.size for f in self.fields)
+
+    def find(self, name: str) -> FieldLayout | None:
+        for f in self.fields:
+            if f.name == name:
+                return f
+        return None
 
 
 @dataclass
@@ -165,6 +185,10 @@ class Module:
     # Used so that e.g. `xs[i]` can return its real element type instead of
     # the generic REF the VM sees.
     symbol_elem_types: dict[str, TypeCode] = field(default_factory=dict)
+    # When a list/matrix has elements of a record type, this maps the
+    # variable to the record's name so the compiler can compute the
+    # per-element stride and resolve `xs[i].field` chains.
+    symbol_elem_record_types: dict[str, str] = field(default_factory=dict)
     # For record variables: the name of the record type. Used to look up
     # field offsets at field-access time.
     symbol_record_types: dict[str, str] = field(default_factory=dict)
