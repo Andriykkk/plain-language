@@ -531,16 +531,19 @@ class Compiler:
                 self.emit(Opcode.ADD_I64, (3, 3, 4))
 
     def compile_print(self, stmt: PrintStmt) -> None:
-        # `print A and B and ...` is one statement → one trailing newline.
+        # `print A, B, ...` is one statement → one trailing newline.
         # Adjacent parts get a single-space separator.
         for i, part in enumerate(stmt.parts):
             if i > 0:
                 self.emit(Opcode.PRINT_SPACE, ())
             ty = self.compile_expr_into(part, reg=0)
-            # TEXT values are arrays of char codes — use PRINT_TEXT to
-            # decode them back. Everything else uses plain PRINT.
+            # TEXT values are arrays of char codes — decode with PRINT_TEXT.
+            # BOOL values are stored as int 0/1 — PRINT_BOOL formats as
+            # "True"/"False". Everything else uses plain PRINT.
             if ty == TypeCode.TEXT:
                 self.emit(Opcode.PRINT_TEXT, (0,))
+            elif ty == TypeCode.BOOL:
+                self.emit(Opcode.PRINT_BOOL, (0,))
             else:
                 self.emit(Opcode.PRINT, (0,))
         self.emit(Opcode.PRINT_NEWLINE, ())
@@ -1110,7 +1113,11 @@ class Compiler:
             return TypeCode.TEXT
 
         if isinstance(expr, BoolLit):
-            addr = self.allocate_constant(expr.value)
+            # Store BOOLs as int 1/0 rather than Python's True/False so
+            # they're indistinguishable from i8 internally — only the
+            # PRINT opcode picks differs (PRINT_BOOL formats them as
+            # "True"/"False"; PRINT shows them as "1"/"0").
+            addr = self.allocate_constant(1 if expr.value else 0)
             self.emit(Opcode.LOAD, (reg, addr))
             return TypeCode.BOOL
 
@@ -1283,10 +1290,11 @@ class Compiler:
 
         if expr.op == "logical_not":
             operand_type = self.compile_expr_into(expr.operand, reg)
-            # Convert to BOOL via truthiness, then flip via NE_BOOL with True.
+            # Convert to BOOL (int 0/1) via truthiness, then flip via
+            # NE_BOOL against 1.
             self.emit_truthy(operand_type, src_reg=reg, dst_reg=reg, scratch=reg + 1)
-            true_addr = self.allocate_constant(True)
-            self.emit(Opcode.LOAD, (reg + 1, true_addr))
+            one_addr = self.allocate_constant(1)
+            self.emit(Opcode.LOAD, (reg + 1, one_addr))
             self.emit(Opcode.NE_BOOL, (reg, reg, reg + 1))
             return TypeCode.BOOL
 
@@ -1310,9 +1318,12 @@ class Compiler:
             self.emit_truthy(src_type, src_reg=reg, dst_reg=reg, scratch=reg + 1)
             return TypeCode.BOOL
         if src_type == TypeCode.BOOL and dst_type in NUMERIC_TYPES:
-            # In Python, True/False ARE int (1/0). The value already
-            # behaves correctly under any numeric opcode; no conversion
-            # instruction needed. A C port would emit a zero-extend here.
+            # BOOL is stored as int 0/1, indistinguishable from i8 in
+            # registers. Casting to any integer width is a no-op; casting
+            # to a float just reuses the existing int→float convert.
+            if dst_type in INTEGER_TYPES:
+                return dst_type
+            self.emit_convert(TypeCode.I8, dst_type, src=reg, dst=reg)
             return dst_type
         if src_type in NUMERIC_TYPES and dst_type in NUMERIC_TYPES:
             self.emit_convert(src_type, dst_type, src=reg, dst=reg)
@@ -1343,7 +1354,7 @@ class Compiler:
             if src_reg == dst_reg:
                 return
             # Copy via NE-with-False (no MOV opcode in this VM).
-            false_addr = self.allocate_constant(False)
+            false_addr = self.allocate_constant(0)
             self.emit(Opcode.LOAD, (scratch, false_addr))
             self.emit(Opcode.NE_BOOL, (dst_reg, src_reg, scratch))
             return
@@ -1365,7 +1376,7 @@ class Compiler:
             return
 
         if src_type == TypeCode.NONE:
-            false_addr = self.allocate_constant(False)
+            false_addr = self.allocate_constant(0)
             self.emit(Opcode.LOAD, (dst_reg, false_addr))
             return
 
@@ -1413,10 +1424,12 @@ class Compiler:
         right_type = self.compile_expr_into(expr.right, reg)
 
         # 5. Pick the result type now that we know both operand types.
+        #    Same type → that type (Python's "return chosen operand").
+        #    Anything else (including mixed numeric widths) → collapse to
+        #    BOOL via truthiness in both branches. The user adds explicit
+        #    `as` casts when they want a specific numeric width.
         if left_type == right_type:
             result_type = left_type
-        elif left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES:
-            result_type = _PROMOTE[(left_type, right_type)]
         else:
             result_type = TypeCode.BOOL
 
@@ -1450,7 +1463,9 @@ class Compiler:
                              scratch=reg + 1)
             return
         if from_type == TypeCode.BOOL and to_type in NUMERIC_TYPES:
-            # Python's bool is int subclass — no instruction needed.
+            if to_type in INTEGER_TYPES:
+                return
+            self.emit_convert(TypeCode.I8, to_type, src=reg, dst=reg)
             return
         if from_type in NUMERIC_TYPES and to_type in NUMERIC_TYPES:
             self.emit_convert(from_type, to_type, src=reg, dst=reg)

@@ -1036,9 +1036,20 @@ class TestBitwise(unittest.TestCase):
         # 12 & 10 = 8; 8 ^ 5 = 13; 13 | 1 = 13.
         self.assertEqual(run_capture("print 12 & 10 ^ 5 | 1\n"), "13\n")
 
-    def test_shift_higher_than_arithmetic_bitwise_lower(self):
-        # 1 << 3 = 8; (5 + 8) & 0xF = 13.
-        self.assertEqual(run_capture("print 5 + 1 << 3 & 15\n"), "13\n")
+    def test_addition_higher_than_shift(self):
+        # `+` binds tighter than `<<` (matches Python).
+        # `5 + 1 << 3` = `(5 + 1) << 3` = `6 << 3` = 48.
+        self.assertEqual(run_capture("print 5 + 1 << 3\n"), "48\n")
+
+    def test_shift_higher_than_bit_and(self):
+        # `<<` binds tighter than `&`.
+        # `8 & 1 << 3` = `8 & (1 << 3)` = `8 & 8` = 8.
+        self.assertEqual(run_capture("print 8 & 1 << 3\n"), "8\n")
+
+    def test_bit_and_higher_than_bit_or(self):
+        # `&` binds tighter than `|`.
+        # `1 | 2 & 0` = `1 | (2 & 0)` = `1 | 0` = 1.
+        self.assertEqual(run_capture("print 1 | 2 & 0\n"), "1\n")
 
     # error cases
 
@@ -1125,9 +1136,13 @@ print xs and xs[0]
         self.assertEqual(run_capture(src), "False\n")
 
     def test_short_circuit_or_skips_right_on_truthy_left(self):
-        # 5 or (1/0) — right would crash, so the test passing means we
-        # didn't evaluate it.
-        self.assertEqual(run_capture("print 5 or (1 / 0)\n"), "5\n")
+        # If `or` didn't short-circuit, xs[100] would crash with an
+        # out-of-range error. Same-type operands (both i64) so the result
+        # type stays i64 and prints "5", not "True".
+        src = """set xs to empty list of i64
+print 5 or xs[100]
+"""
+        self.assertEqual(run_capture(src), "5\n")
 
     # not / !
 

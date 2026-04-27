@@ -126,6 +126,7 @@ class Opcode(Enum):
     # statement, and `PRINT_SPACE` between adjacent parts.
     PRINT         = auto()  # (r_src,)        — write str(value), no newline
     PRINT_TEXT    = auto()  # (r_src,)        — decode a list of char codes and write
+    PRINT_BOOL    = auto()  # (r_src,)        — write "True" if value truthy else "False"
     PRINT_SPACE   = auto()  # ()              — write a single space
     PRINT_NEWLINE = auto()  # ()              — write a single '\n'
     HALT          = auto()

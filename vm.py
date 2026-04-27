@@ -231,24 +231,26 @@ def execute(module: Module) -> None:
 
         # --- typed comparisons (all produce BOOL; collapse to Python ops) ---
 
+        # Comparisons store BOOL values as int 0/1 (not Python True/False)
+        # so they print and convert uniformly with everything else BOOL-typed.
         elif op in _EQ_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] == registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] == registers[r_b] else 0
         elif op in _NE_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] != registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] != registers[r_b] else 0
         elif op in _LT_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] < registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] < registers[r_b] else 0
         elif op in _LE_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] <= registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] <= registers[r_b] else 0
         elif op in _GT_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] > registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] > registers[r_b] else 0
         elif op in _GE_OPS:
             r_dst, r_a, r_b = operands
-            registers[r_dst] = registers[r_a] >= registers[r_b]
+            registers[r_dst] = 1 if registers[r_a] >= registers[r_b] else 0
 
         # --- typed bitwise (integer-only, rejected on floats by compiler) ---
 
@@ -285,6 +287,10 @@ def execute(module: Module) -> None:
             # Register holds an array of character codes — decode and write.
             chars = registers[r_src]
             sys.stdout.write("".join(chr(c) for c in chars))
+
+        elif op is Opcode.PRINT_BOOL:
+            (r_src,) = operands
+            sys.stdout.write("True" if registers[r_src] else "False")
 
         elif op is Opcode.PRINT_SPACE:
             sys.stdout.write(" ")
