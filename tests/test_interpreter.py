@@ -983,7 +983,7 @@ repeat for each it in items
 end
 print total
 """
-        self.assertEqual(run_capture(src), "apple\n5\n7\n")
+        self.assertEqual(run_capture(src), "apple\n5.0\n7\n")
 
 
 class TestErrors(unittest.TestCase):

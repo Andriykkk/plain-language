@@ -1404,7 +1404,15 @@ class Compiler:
         self.compile_loop(cond_emit=cond, post_emit=post, body=stmt.body)
 
     def compile_repeat_foreach(self, stmt: RepeatForEachStmt) -> None:
-        """`repeat for each v in xs` — iterate over a list or matrix.
+        """`repeat for each v in <iterable>` — iterate over a list, matrix,
+        or text expression.
+
+        The iterable can be any expression that produces a heap-allocated
+        array (a list/matrix variable, a string literal, an empty list,
+        etc.). The compiler infers the element type from the AST so that
+        the per-iteration access uses the right stride. The result of the
+        iterable expression is held in a hidden variable for the duration
+        of the loop.
 
         For primitive elements: the loop variable holds each successive
         element value, taken via LOAD_AT against the container's pointer.
@@ -1412,23 +1420,32 @@ class Compiler:
         `xs[i]` — chain accesses through it (e.g. `v.field`) translate to
         accesses on the underlying container at the right slot offset.
         """
-        if not isinstance(stmt.iterable, VarRef):
-            raise CompileError("'for each' iterable must be a variable")
-        name = stmt.iterable.name
-        if name not in self.module.symbol_table:
-            raise CompileError(f"undeclared variable {name!r}")
-
-        elem_rec_name = self.module.symbol_elem_record_types.get(name)
-        # A list/matrix is iterable; a primitive variable isn't. We detect
-        # "iterable" by the presence of an element type in either map.
-        if (name not in self.module.symbol_elem_types
-                and elem_rec_name is None):
-            raise CompileError(f"{name!r} isn't iterable")
-
-        elem_type = self.module.symbol_elem_types.get(name, TypeCode.REF)
+        # Infer element type / record name statically so we know the stride.
+        elem_type, elem_rec_name = self._infer_iterable_info(stmt.iterable)
+        if elem_type is None and elem_rec_name is None:
+            raise CompileError(
+                "'for each' requires an iterable (list, matrix, or text)"
+            )
+        if elem_type is None:
+            elem_type = TypeCode.REF
         K = self.module.records[elem_rec_name].size if elem_rec_name else 1
 
-        list_addr = self.module.symbol_table[name]
+        # Compile the iterable once into a hidden variable. We can't keep
+        # it in a register because the body may use any register freely.
+        # Direct VarRef: we already have a memory slot — reuse it. Other
+        # expressions: stash the heap pointer in a hidden slot.
+        if isinstance(stmt.iterable, VarRef) \
+                and stmt.iterable.name in self.module.symbol_table:
+            name = stmt.iterable.name
+            list_addr = self.module.symbol_table[name]
+        else:
+            name = self._hidden("iter")
+            list_addr = self.allocate_variable(name, TypeCode.REF)
+            self.module.symbol_elem_types[name] = elem_type
+            if elem_rec_name is not None:
+                self.module.symbol_elem_record_types[name] = elem_rec_name
+            self.compile_expr_into(stmt.iterable, reg=0)
+            self.emit(Opcode.STORE, (0, list_addr))
         idx_var = self._hidden("idx")
         len_var = self._hidden("len")
         idx_addr = self.allocate_variable(idx_var, TypeCode.I64)
@@ -1716,6 +1733,34 @@ class Compiler:
         if type_ref.name in PRIMITIVE_TYPES:
             return PRIMITIVE_TYPES[type_ref.name]
         return TypeCode.REF
+
+    def _infer_iterable_info(self, expr) -> tuple["TypeCode | None", "str | None"]:
+        """For an expression that should produce an iterable container,
+        return its (element_type, element_record_name). Either may be None
+        if the compiler can't tell statically — caller treats that as a
+        compile-time error."""
+        if isinstance(expr, StringLit):
+            return TypeCode.I8, None
+        if isinstance(expr, EmptyList):
+            elem_t = self.typeref_to_elem_code(expr.elem_type)
+            elem_rec = (
+                expr.elem_type.name
+                if expr.elem_type.name in self.module.records else None
+            )
+            return elem_t, elem_rec
+        if isinstance(expr, EmptyMatrix):
+            elem_t = self.typeref_to_elem_code(expr.elem_type)
+            elem_rec = (
+                expr.elem_type.name
+                if expr.elem_type.name in self.module.records else None
+            )
+            return elem_t, elem_rec
+        if isinstance(expr, VarRef):
+            name = expr.name
+            elem_t = self.module.symbol_elem_types.get(name)
+            elem_rec = self.module.symbol_elem_record_types.get(name)
+            return elem_t, elem_rec
+        return None, None
 
     def _infer_elem_record_name(self, expr) -> str | None:
         """If `expr` produces a list/matrix whose elements are a known
