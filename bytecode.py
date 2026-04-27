@@ -55,6 +55,12 @@ class Opcode(Enum):
     APPEND   = auto()  # (r_ptr, r_val)             — (*r_ptr).append(r_val)
     LEN      = auto()  # (r_dst, r_ptr)             — r_dst = len(*r_ptr)
 
+    # Map ops — use a Python dict at runtime. Eventually swappable for a
+    # hand-rolled hash table without changing bytecode.
+    MAP_NEW  = auto()  # (r_dst,)                   — r_dst = {}
+    MAP_GET  = auto()  # (r_dst, r_map, r_key)      — r_dst = (*r_map)[r_key]; missing → VMError
+    MAP_SET  = auto()  # (r_map, r_key, r_val)      — (*r_map)[r_key] = r_val
+
     # Typed arithmetic — each opcode takes (r_dst, r_a, r_b). The compiler
     # picks the one matching the operand types; it inserts conversions
     # beforehand when a mixed-type expression needs promotion.
@@ -200,6 +206,10 @@ class Module:
     # variable to the record's name so the compiler can compute the
     # per-element stride and resolve `xs[i].field` chains.
     symbol_elem_record_types: dict[str, str] = field(default_factory=dict)
+    # For map variables: (key_type, value_type). Indexing a map dispatches
+    # to MAP_GET / MAP_SET rather than LOAD_AT / STORE_AT.
+    symbol_map_types: dict[str, tuple[TypeCode, TypeCode]] = \
+        field(default_factory=dict)
     # For record variables: the name of the record type. Used to look up
     # field offsets at field-access time.
     symbol_record_types: dict[str, str] = field(default_factory=dict)

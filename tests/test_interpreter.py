@@ -768,7 +768,7 @@ print xs[5]
 
 class TestMaps(unittest.TestCase):
     def test_empty_map_and_assign(self):
-        src = """set ages to empty map of text to number
+        src = """set ages to empty map of text to i64
 set ages["Alice"] to 30
 set ages["Bob"] to 25
 print ages["Alice"]
@@ -777,7 +777,7 @@ print ages["Bob"]
         self.assertEqual(run_capture(src), "30\n25\n")
 
     def test_map_length(self):
-        src = """set m to empty map of text to number
+        src = """set m to empty map of text to i64
 set m["a"] to 1
 set m["b"] to 2
 print length of m
@@ -785,19 +785,69 @@ print length of m
         self.assertEqual(run_capture(src), "2\n")
 
     def test_missing_key_errors(self):
-        src = """set m to empty map of text to number
+        src = """set m to empty map of text to i64
 print m["missing"]
 """
         with self.assertRaises(RunError):
             run_capture(src)
 
     def test_add_to_map_value(self):
-        src = """set m to empty map of text to number
+        src = """set m to empty map of text to i64
 set m["x"] to 10
 add 5 to m["x"]
 print m["x"]
 """
         self.assertEqual(run_capture(src), "15\n")
+
+    def test_integer_keys(self):
+        src = """set m to empty map of i64 to text
+set m[1] to "one"
+set m[2] to "two"
+print m[1]
+print m[2]
+"""
+        self.assertEqual(run_capture(src), "one\ntwo\n")
+
+    def test_float_values(self):
+        src = """set m to empty map of text to f64
+set m["pi"] to 3.14
+set m["e"] to 2.71
+print m["pi"]
+print m["e"]
+"""
+        self.assertEqual(run_capture(src), "3.14\n2.71\n")
+
+    def test_bool_values(self):
+        src = """set m to empty map of text to bool
+set m["yes"] to true
+set m["no"] to false
+print m["yes"]
+print m["no"]
+"""
+        self.assertEqual(run_capture(src), "True\nFalse\n")
+
+    def test_record_values(self):
+        # Map values can be records — the dict stores the heap pointer.
+        src = """define record Person
+    name as text
+    age as i64
+end
+
+set people to empty map of text to Person
+
+set p to new Person
+set p.name to "Alice"
+set p.age to 30
+set people["alice"] to p
+
+set q to new Person
+set q.name to "Bob"
+set q.age to 42
+set people["bob"] to q
+
+print length of people
+"""
+        self.assertEqual(run_capture(src), "2\n")
 
 
 class TestMatrices(unittest.TestCase):

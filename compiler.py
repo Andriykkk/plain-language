@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 from bytecode import FieldLayout, Instruction, Module, Opcode, RecordLayout, TypeCode
 from parser import (
     AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, Cast, ColumnsExpr,
-    Compare, EmptyList, EmptyMatrix, FieldAccess, FieldLValue, FunctionDef,
-    IfStmt, IndexAccess, IndexLValue, LengthExpr, NewExpr, NoneLit, NumberLit,
-    PrintStmt, RecordDef, RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt,
-    RepeatWhileStmt, ReturnStmt, RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt,
-    StringLit, TypeRef, UnaryOp, VarLValue, VarRef,
+    Compare, EmptyList, EmptyMap, EmptyMatrix, FieldAccess, FieldLValue,
+    FunctionDef, IfStmt, IndexAccess, IndexLValue, LengthExpr, NewExpr,
+    NoneLit, NumberLit, PrintStmt, RecordDef, RepeatForEachStmt,
+    RepeatRangeStmt, RepeatTimesStmt, RepeatWhileStmt, ReturnStmt, RowsExpr,
+    SetStmt, SkipStmt, Stmt, StopStmt, StringLit, TypeRef, UnaryOp, VarLValue,
+    VarRef,
 )
 
 
@@ -359,6 +360,11 @@ class Compiler:
         if isinstance(target, VarLValue) and isinstance(stmt.value, EmptyMatrix):
             return self.compile_set_matrix(target.name, stmt.value)
 
+        # Map creation — like matrix, the compiler binds key/value types
+        # to the variable so indexing dispatches to MAP_GET / MAP_SET.
+        if isinstance(target, VarLValue) and isinstance(stmt.value, EmptyMap):
+            return self.compile_set_map(target.name, stmt.value)
+
         # Record creation — the compiler remembers which record type the
         # variable holds so later `p.field` reads know the layout.
         if isinstance(target, VarLValue) and isinstance(stmt.value, NewExpr):
@@ -390,6 +396,13 @@ class Compiler:
                 self.compile_expr_into(target.indices[0], reg=2)
                 self.emit(Opcode.STORE_AT, (0, 1, 2))
                 return
+            # Map write — `set m[k] to v` dispatches to MAP_SET, not the
+            # offset-arithmetic chain walker.
+            if (len(target.indices) == 1
+                    and isinstance(target.obj, VarRef)
+                    and target.obj.name in self.module.symbol_map_types):
+                return self.compile_map_set(target.obj.name,
+                                            target.indices[0], stmt.value)
             return self.compile_chain_store(target_expr, stmt.value)
 
         # ----- set x to value [as <type>] -----
@@ -549,6 +562,76 @@ class Compiler:
         self.emit(Opcode.PRINT_NEWLINE, ())
 
     # ----- matrix-specific -----
+
+    def compile_set_map(self, name: str, em: EmptyMap) -> None:
+        """Allocate a fresh empty map, bind the variable to its pointer,
+        and remember the (key_type, value_type) pair so subsequent
+        `m[k]` access can type-check and dispatch to MAP_GET / MAP_SET."""
+        key_type = self.typeref_to_elem_code(em.key_type)
+        val_type = self.typeref_to_elem_code(em.value_type)
+
+        # r0 holds the new dict.
+        self.emit(Opcode.MAP_NEW, (0,))
+
+        if name in self.module.symbol_table:
+            if self.module.symbol_types[name] != TypeCode.REF:
+                raise CompileError(f"cannot re-type {name!r} as a map")
+            addr = self.module.symbol_table[name]
+        else:
+            addr = self.allocate_variable(name, TypeCode.REF)
+        self.module.symbol_map_types[name] = (key_type, val_type)
+        self.emit(Opcode.STORE, (0, addr))
+
+    def compile_map_get(self, name: str, key_expr, reg: int) -> TypeCode:
+        """Compile `m[k]` for a map variable. Emits MAP_GET; missing-key
+        is a runtime error from the VM."""
+        key_type, val_type = self.module.symbol_map_types[name]
+        # r_dst = reg, r_map in reg+1, r_key in reg+2
+        addr = self.module.symbol_table[name]
+        self.emit(Opcode.LOAD, (reg + 1, addr))
+        idx_type = self.compile_expr_into(key_expr, reg + 2)
+        if idx_type != key_type:
+            if idx_type in NUMERIC_TYPES and key_type in NUMERIC_TYPES:
+                self.emit_convert(idx_type, key_type, src=reg + 2, dst=reg + 2)
+            else:
+                raise CompileError(
+                    f"map {name!r} expects {key_type.name} keys, got "
+                    f"{idx_type.name}"
+                )
+        self.emit(Opcode.MAP_GET, (reg, reg + 1, reg + 2))
+        return val_type
+
+    def compile_map_set(self, name: str, key_expr, value_expr) -> None:
+        """Compile `set m[k] to v` for a map variable. Computes the value
+        first into r0 (so its sub-expressions can use r1+ as scratch),
+        then sets up the map pointer and key, then emits MAP_SET."""
+        key_type, val_type = self.module.symbol_map_types[name]
+
+        # 1. Value into r0, with a coercion if numeric widths differ.
+        v_type = self.compile_expr_into(value_expr, reg=0)
+        if v_type != val_type:
+            if v_type in NUMERIC_TYPES and val_type in NUMERIC_TYPES:
+                self.emit_convert(v_type, val_type, src=0, dst=0)
+            else:
+                raise CompileError(
+                    f"map {name!r} expects {val_type.name} values, got "
+                    f"{v_type.name}"
+                )
+
+        # 2. Map pointer into r1, key into r2.
+        addr = self.module.symbol_table[name]
+        self.emit(Opcode.LOAD, (1, addr))
+        k_type = self.compile_expr_into(key_expr, reg=2)
+        if k_type != key_type:
+            if k_type in NUMERIC_TYPES and key_type in NUMERIC_TYPES:
+                self.emit_convert(k_type, key_type, src=2, dst=2)
+            else:
+                raise CompileError(
+                    f"map {name!r} expects {key_type.name} keys, got "
+                    f"{k_type.name}"
+                )
+
+        self.emit(Opcode.MAP_SET, (1, 2, 0))
 
     def compile_set_matrix(self, name: str, em: EmptyMatrix) -> None:
         shape = []
@@ -1165,6 +1248,11 @@ class Compiler:
             return TypeCode.REF
 
         if isinstance(expr, IndexAccess):
+            # Map read — dispatches to MAP_GET.
+            if (len(expr.indices) == 1
+                    and isinstance(expr.obj, VarRef)
+                    and expr.obj.name in self.module.symbol_map_types):
+                return self.compile_map_get(expr.obj.name, expr.indices[0], reg)
             return self.compile_chain_load(expr, reg)
 
         if isinstance(expr, FieldAccess):

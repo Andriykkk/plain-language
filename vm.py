@@ -150,6 +150,31 @@ def execute(module: Module) -> None:
             r_dst, r_ptr = operands
             registers[r_dst] = len(registers[r_ptr])
 
+        # --- maps -------------------------------------------------------------
+
+        elif op is Opcode.MAP_NEW:
+            (r_dst,) = operands
+            registers[r_dst] = {}
+
+        elif op is Opcode.MAP_GET:
+            r_dst, r_map, r_key = operands
+            d = registers[r_map]
+            k = registers[r_key]
+            # Text values (and other heap arrays) are Python lists, which
+            # aren't hashable. Normalize to a tuple for use as a dict key.
+            if isinstance(k, list):
+                k = tuple(k)
+            if k not in d:
+                raise VMError(f"key not found in map: {k!r}")
+            registers[r_dst] = d[k]
+
+        elif op is Opcode.MAP_SET:
+            r_map, r_key, r_val = operands
+            k = registers[r_key]
+            if isinstance(k, list):
+                k = tuple(k)
+            registers[r_map][k] = registers[r_val]
+
         # --- value stack ------------------------------------------------------
 
         elif op is Opcode.PUSH:
