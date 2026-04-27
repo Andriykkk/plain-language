@@ -224,6 +224,12 @@ class Compiler:
         # Patched at the end of compile_program once every body's entry is
         # known.
         self.pending_call_patches: list[tuple[int, str]] = []
+        # `repeat for each v in xs` over a list of records binds `v` as a
+        # synthetic alias for `xs[idx]` rather than a real variable. The
+        # chain walker dispatches through this map: when it sees `v` as the
+        # root of a chain, it substitutes IndexAccess(VarRef(xs), [idx_var]).
+        # Maps loop_var_name → (container_var_name, idx_var_name, record_name).
+        self._view_aliases: dict[str, tuple[str, str, str]] = {}
 
     # ----- entry -----
 
@@ -304,9 +310,7 @@ class Compiler:
         if isinstance(stmt, RepeatRangeStmt):
             return self.compile_repeat_range(stmt)
         if isinstance(stmt, RepeatForEachStmt):
-            raise CompileError(
-                "'repeat for each' isn't implemented yet — needs iterator state"
-            )
+            return self.compile_repeat_foreach(stmt)
         if isinstance(stmt, StopStmt):
             return self.compile_stop()
         if isinstance(stmt, SkipStmt):
@@ -758,6 +762,13 @@ class Compiler:
         """
         if isinstance(expr, VarRef):
             name = expr.name
+            # View-alias: `v` was bound by `for each v in xs` for a list of
+            # records. Treat it as `xs[idx]` and walk that synthetic chain.
+            if name in self._view_aliases:
+                container, idx_name, _record = self._view_aliases[name]
+                # Substitute: `v.field...` becomes `container[idx].field...`
+                synthetic = IndexAccess(VarRef(container), [VarRef(idx_name)])
+                return self._walk_chain(synthetic)
             # Parameters live on the value stack, not in main memory; chain
             # access through a parameter would need an entirely different
             # base-pointer story. Reject for now.
@@ -1391,6 +1402,123 @@ class Compiler:
             self.emit(Opcode.STORE,   (0, var_addr))
 
         self.compile_loop(cond_emit=cond, post_emit=post, body=stmt.body)
+
+    def compile_repeat_foreach(self, stmt: RepeatForEachStmt) -> None:
+        """`repeat for each v in xs` — iterate over a list or matrix.
+
+        For primitive elements: the loop variable holds each successive
+        element value, taken via LOAD_AT against the container's pointer.
+        For record elements: the loop variable behaves as if it were
+        `xs[i]` — chain accesses through it (e.g. `v.field`) translate to
+        accesses on the underlying container at the right slot offset.
+        """
+        if not isinstance(stmt.iterable, VarRef):
+            raise CompileError("'for each' iterable must be a variable")
+        name = stmt.iterable.name
+        if name not in self.module.symbol_table:
+            raise CompileError(f"undeclared variable {name!r}")
+
+        elem_rec_name = self.module.symbol_elem_record_types.get(name)
+        # A list/matrix is iterable; a primitive variable isn't. We detect
+        # "iterable" by the presence of an element type in either map.
+        if (name not in self.module.symbol_elem_types
+                and elem_rec_name is None):
+            raise CompileError(f"{name!r} isn't iterable")
+
+        elem_type = self.module.symbol_elem_types.get(name, TypeCode.REF)
+        K = self.module.records[elem_rec_name].size if elem_rec_name else 1
+
+        list_addr = self.module.symbol_table[name]
+        idx_var = self._hidden("idx")
+        len_var = self._hidden("len")
+        idx_addr = self.allocate_variable(idx_var, TypeCode.I64)
+        len_addr = self.allocate_variable(len_var, TypeCode.I64)
+        zero_addr = self.allocate_constant(0)
+        one_addr = self.allocate_constant(1)
+
+        # idx = 0
+        self.emit(Opcode.LOAD,  (0, zero_addr))
+        self.emit(Opcode.STORE, (0, idx_addr))
+
+        # cached_len = len(container) // K  (number of elements, not slots)
+        self.emit(Opcode.LOAD, (1, list_addr))
+        self.emit(Opcode.LEN,  (0, 1))
+        if K > 1:
+            k_addr = self.allocate_constant(K)
+            self.emit(Opcode.LOAD, (1, k_addr))
+            self.emit_convert(TypeCode.I64, TypeCode.F64, src=0, dst=0)
+            self.emit_convert(TypeCode.I64, TypeCode.F64, src=1, dst=1)
+            self.emit(Opcode.DIV_F64, (0, 0, 1))
+            self.emit_convert(TypeCode.F64, TypeCode.I64, src=0, dst=0)
+        self.emit(Opcode.STORE, (0, len_addr))
+
+        # Bind the loop variable. For primitive elements, `v` is a real
+        # variable holding a copy of the current element. For record
+        # elements, register `v` as a view-alias for `xs[idx]`; chain
+        # accesses through it route through that synthetic IndexAccess.
+        prev_view = self._view_aliases.get(stmt.var)
+        if elem_rec_name is not None:
+            self._view_aliases[stmt.var] = (name, idx_var, elem_rec_name)
+            var_addr = None
+        else:
+            if stmt.var in self.module.symbol_table:
+                if self.module.symbol_types[stmt.var] != elem_type:
+                    raise CompileError(
+                        f"loop variable {stmt.var!r} already has a different type"
+                    )
+                var_addr = self.module.symbol_table[stmt.var]
+            else:
+                var_addr = self.allocate_variable(stmt.var, elem_type)
+
+        # Inline the loop (compile_loop's helper doesn't have a body-pre
+        # hook, and we need to refresh `v` from `xs[idx]` at the start of
+        # each iteration).
+        loop_top = self.current_pos()
+
+        # Condition: idx < len → r0
+        self.emit(Opcode.LOAD,   (1, idx_addr))
+        self.emit(Opcode.LOAD,   (2, len_addr))
+        self.emit(Opcode.LT_I64, (0, 1, 2))
+        jmpf_idx = self.emit_placeholder_jump(Opcode.JMPF, r_cond=0)
+
+        # Body-pre: for primitive elements, v = container[idx]. Records
+        # don't need a refresh — the view-alias dispatches directly.
+        if elem_rec_name is None:
+            self.emit(Opcode.LOAD,    (1, list_addr))
+            self.emit(Opcode.LOAD,    (2, idx_addr))
+            self.emit(Opcode.LOAD_AT, (0, 1, 2))
+            self.emit(Opcode.STORE,   (0, var_addr))
+
+        ctx = LoopContext()
+        self.loop_stack.append(ctx)
+        for s in stmt.body:
+            self.compile_stmt(s)
+        self.loop_stack.pop()
+
+        cont_target = self.current_pos()
+
+        # idx += 1
+        self.emit(Opcode.LOAD,    (1, idx_addr))
+        self.emit(Opcode.LOAD,    (2, one_addr))
+        self.emit(Opcode.ADD_I64, (0, 1, 2))
+        self.emit(Opcode.STORE,   (0, idx_addr))
+
+        self.emit(Opcode.JMP, (loop_top,))
+        end_target = self.current_pos()
+
+        self.patch_jmp_target(jmpf_idx, end_target)
+        for jx in ctx.break_patches:
+            self.patch_jmp_target(jx, end_target)
+        for jx in ctx.continue_patches:
+            self.patch_jmp_target(jx, cont_target)
+
+        # Restore the previous view-alias (for nested for-each over
+        # records, which would shadow the outer alias).
+        if elem_rec_name is not None:
+            if prev_view is None:
+                self._view_aliases.pop(stmt.var, None)
+            else:
+                self._view_aliases[stmt.var] = prev_view
 
     def compile_stop(self) -> None:
         if not self.loop_stack:

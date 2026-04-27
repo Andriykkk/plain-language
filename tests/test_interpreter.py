@@ -642,17 +642,15 @@ print r.w
 
     def test_nested_field_access(self):
         src = """define record Inner
-    value as number
+    value as i64
 end
 
 define record Outer
-    inner as number
+    inner as Inner
 end
 
-set i to new Inner
-set i.value to 42
 set o to new Outer
-set o.inner to i
+set o.inner.value to 42
 print o.inner.value
 """
         self.assertEqual(run_capture(src), "42\n")
