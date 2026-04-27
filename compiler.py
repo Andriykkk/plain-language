@@ -534,8 +534,39 @@ class Compiler:
         elem_size = (
             self.module.records[elem_rec_name].size if elem_rec_name else 1
         )
-        total = shape[0] * shape[1] * elem_size
+        cells = shape[0] * shape[1]
+        total = cells * elem_size
         self.emit(Opcode.ALLOC, (0, total))
+
+        # Initialize each cell. ALLOC zero-fills with None, which would
+        # surface as the literal "None" on `print g[i,j]`. Numeric cells
+        # get the type's zero, text/ref cells get a fresh empty array,
+        # record cells are zeroed recursively per-field.
+        elem_type_code = self.typeref_to_elem_code(em.elem_type)
+        if elem_rec_name is not None:
+            layout = self.module.records[elem_rec_name]
+            for cell in range(cells):
+                self._init_record_at(
+                    ptr_reg=0, layout=layout,
+                    base_offset=cell * elem_size,
+                    scratch_val=1, scratch_off=2,
+                )
+        else:
+            if elem_type_code == TypeCode.TEXT or elem_type_code == TypeCode.REF:
+                # Each cell gets its own fresh empty array.
+                for slot in range(total):
+                    self.emit(Opcode.ALLOC, (1, 0))
+                    slot_addr = self.allocate_constant(slot)
+                    self.emit(Opcode.LOAD, (2, slot_addr))
+                    self.emit(Opcode.STORE_AT, (1, 0, 2))
+            else:
+                default = self._default_for_field(elem_type_code)
+                default_addr = self.allocate_constant(default)
+                self.emit(Opcode.LOAD, (1, default_addr))
+                for slot in range(total):
+                    slot_addr = self.allocate_constant(slot)
+                    self.emit(Opcode.LOAD, (2, slot_addr))
+                    self.emit(Opcode.STORE_AT, (1, 0, 2))
 
         if name in self.module.symbol_table:
             if self.module.symbol_types[name] != TypeCode.REF:
@@ -546,7 +577,7 @@ class Compiler:
 
         # Shape and element type — purely compile-time metadata.
         self.module.symbol_shapes[name] = tuple(shape)
-        self.module.symbol_elem_types[name] = self.typeref_to_elem_code(em.elem_type)
+        self.module.symbol_elem_types[name] = elem_type_code
         if elem_rec_name is not None:
             self.module.symbol_elem_record_types[name] = elem_rec_name
         self.emit(Opcode.STORE, (0, addr))

@@ -497,7 +497,7 @@ end
 
 print call uses_helper
 """
-        self.assertEqual(run_capture(src), "42\n")
+        self.assertEqual(run_capture(src), "42.0\n")
 
     def test_return_value_in_expression(self):
         src = """define function five
@@ -730,7 +730,7 @@ append 3 to xs
 set xs[1] to 99
 print xs[1]
 """
-        self.assertEqual(run_capture(src), "99\n")
+        self.assertEqual(run_capture(src), "99.0\n")
 
     def test_add_to_list_element(self):
         src = """set xs to empty list of number
@@ -809,7 +809,7 @@ print g[0, 0]
 print g[1, 2]
 print length of g
 """
-        self.assertEqual(run_capture(src), "0\n0\n6\n")
+        self.assertEqual(run_capture(src), "0.0\n0.0\n6\n")
 
     def test_set_and_read_cells(self):
         src = """set g to empty matrix 3 by 3 of number
@@ -820,7 +820,7 @@ print g[0, 0]
 print g[1, 1]
 print g[2, 2]
 """
-        self.assertEqual(run_capture(src), "10\n20\n30\n")
+        self.assertEqual(run_capture(src), "10.0\n20.0\n30.0\n")
 
     def test_rows_and_columns(self):
         src = """set g to empty matrix 4 by 7 of number
@@ -954,7 +954,7 @@ print c[1, 0]
 print c[1, 1]
 """
         # [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]]
-        self.assertEqual(run_capture(src), "19\n22\n43\n50\n")
+        self.assertEqual(run_capture(src), "19.0\n22.0\n43.0\n50.0\n")
 
 
 class TestListsOfRecords(unittest.TestCase):
