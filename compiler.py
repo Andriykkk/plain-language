@@ -19,7 +19,7 @@ from parser import (
     IndexAccess, IndexLValue, LengthExpr, NewExpr, NoneLit, NumberLit,
     PrintStmt, RecordDef, RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt,
     RepeatWhileStmt, ReturnStmt, RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt,
-    StringLit, TypeRef, VarLValue, VarRef,
+    StringLit, TypeRef, UnaryOp, VarLValue, VarRef,
 )
 
 
@@ -96,6 +96,8 @@ PRIMITIVE_TYPES = {
 NUMERIC_TYPES = {TypeCode.I8, TypeCode.I32, TypeCode.I64,
                  TypeCode.F32, TypeCode.F64}
 
+INTEGER_TYPES = {TypeCode.I8, TypeCode.I32, TypeCode.I64}
+
 
 # Promotion table — given two numeric types, what's the common type that
 # covers both? "Covers" means the result can hold any value of either operand
@@ -146,6 +148,33 @@ _ARITH_OPCODES: dict[tuple[str, TypeCode], Opcode] = {
     ("times",   TypeCode.F64): Opcode.MUL_F64,
     ("divided", TypeCode.F32): Opcode.DIV_F32,
     ("divided", TypeCode.F64): Opcode.DIV_F64,
+}
+
+
+# Bitwise opcodes per (op, integer-type). Float operands are rejected
+# before this table is consulted.
+_BITWISE_OPCODES: dict[tuple[str, TypeCode], Opcode] = {
+    ("bit_and",     TypeCode.I8):  Opcode.BIT_AND_I8,
+    ("bit_and",     TypeCode.I32): Opcode.BIT_AND_I32,
+    ("bit_and",     TypeCode.I64): Opcode.BIT_AND_I64,
+    ("bit_or",      TypeCode.I8):  Opcode.BIT_OR_I8,
+    ("bit_or",      TypeCode.I32): Opcode.BIT_OR_I32,
+    ("bit_or",      TypeCode.I64): Opcode.BIT_OR_I64,
+    ("bit_xor",     TypeCode.I8):  Opcode.BIT_XOR_I8,
+    ("bit_xor",     TypeCode.I32): Opcode.BIT_XOR_I32,
+    ("bit_xor",     TypeCode.I64): Opcode.BIT_XOR_I64,
+    ("shift_left",  TypeCode.I8):  Opcode.SHL_I8,
+    ("shift_left",  TypeCode.I32): Opcode.SHL_I32,
+    ("shift_left",  TypeCode.I64): Opcode.SHL_I64,
+    ("shift_right", TypeCode.I8):  Opcode.SHR_I8,
+    ("shift_right", TypeCode.I32): Opcode.SHR_I32,
+    ("shift_right", TypeCode.I64): Opcode.SHR_I64,
+}
+
+_BIT_NOT_OPCODES: dict[TypeCode, Opcode] = {
+    TypeCode.I8:  Opcode.BIT_NOT_I8,
+    TypeCode.I32: Opcode.BIT_NOT_I32,
+    TypeCode.I64: Opcode.BIT_NOT_I64,
 }
 
 
@@ -1036,6 +1065,8 @@ class Compiler:
         # transitively contain a call.
         if isinstance(expr, BinaryOp):
             return self._contains_call(expr.left) or self._contains_call(expr.right)
+        if isinstance(expr, UnaryOp):
+            return self._contains_call(expr.operand)
         if isinstance(expr, Compare):
             return self._contains_call(expr.left) or self._contains_call(expr.right)
         if isinstance(expr, IndexAccess):
@@ -1111,6 +1142,9 @@ class Compiler:
         if isinstance(expr, BinaryOp):
             return self.compile_binop(expr, reg)
 
+        if isinstance(expr, UnaryOp):
+            return self.compile_unary(expr, reg)
+
         if isinstance(expr, Compare):
             return self.compile_compare(expr, reg)
 
@@ -1185,6 +1219,24 @@ class Compiler:
             self.emit(Opcode.POP, (left_reg,))
             self.stack_delta -= 1
 
+        # Bitwise ops: both operands must be integer types. Floats are
+        # rejected here rather than letting them flow into the dispatch
+        # table and miss.
+        if expr.op in ("bit_and", "bit_or", "bit_xor",
+                       "shift_left", "shift_right"):
+            if left_type not in INTEGER_TYPES or right_type not in INTEGER_TYPES:
+                raise CompileError(
+                    f"bitwise '{expr.op}' requires integer operands, got "
+                    f"{left_type.name} and {right_type.name}"
+                )
+            # Promote both to the common integer width.
+            result_type = _PROMOTE[(left_type, right_type)]
+            self.coerce(left_type,  result_type, left_reg)
+            self.coerce(right_type, result_type, right_reg)
+            opcode = _BITWISE_OPCODES[(expr.op, result_type)]
+            self.emit(opcode, (reg, left_reg, right_reg))
+            return result_type
+
         if left_type not in NUMERIC_TYPES or right_type not in NUMERIC_TYPES:
             raise CompileError(
                 f"arithmetic requires numeric operands, got "
@@ -1203,6 +1255,21 @@ class Compiler:
         opcode = _ARITH_OPCODES[(expr.op, result_type)]
         self.emit(opcode, (reg, left_reg, right_reg))
         return result_type
+
+    def compile_unary(self, expr: UnaryOp, reg: int) -> TypeCode:
+        """Currently only `bit_not` (`~x` and `bit not x`)."""
+        if expr.op != "bit_not":
+            raise CompileError(f"unsupported unary op: {expr.op}")
+        operand_reg = reg + 1
+        operand_type = self.compile_expr_into(expr.operand, operand_reg)
+        if operand_type not in INTEGER_TYPES:
+            raise CompileError(
+                f"bitwise 'not' requires an integer operand, got "
+                f"{operand_type.name}"
+            )
+        opcode = _BIT_NOT_OPCODES[operand_type]
+        self.emit(opcode, (reg, operand_reg))
+        return operand_type
 
     def compile_compare(self, expr: Compare, reg: int) -> TypeCode:
         """Typed comparison. Same promotion rules as arithmetic for numeric

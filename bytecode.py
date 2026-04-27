@@ -89,6 +89,16 @@ class Opcode(Enum):
     EQ_BOOL = auto(); NE_BOOL = auto()
     EQ_REF  = auto(); NE_REF  = auto()
 
+    # Typed bitwise — integer-only. Float operands are rejected at compile
+    # time. Same (r_dst, r_a, r_b) shape as arithmetic; SHL/SHR take the
+    # shift amount in r_b. BIT_NOT is unary, (r_dst, r_src).
+    BIT_AND_I8  = auto(); BIT_AND_I32 = auto(); BIT_AND_I64 = auto()
+    BIT_OR_I8   = auto(); BIT_OR_I32  = auto(); BIT_OR_I64  = auto()
+    BIT_XOR_I8  = auto(); BIT_XOR_I32 = auto(); BIT_XOR_I64 = auto()
+    BIT_NOT_I8  = auto(); BIT_NOT_I32 = auto(); BIT_NOT_I64 = auto()
+    SHL_I8      = auto(); SHL_I32     = auto(); SHL_I64     = auto()
+    SHR_I8      = auto(); SHR_I32     = auto(); SHR_I64     = auto()
+
     # Control flow. `target` is an absolute instruction index in the code list.
     # Placeholder target of None during compilation; patched when known.
     JMP  = auto()  # (target,)

@@ -17,6 +17,12 @@ class TK(Enum):
     MINUS = auto()
     STAR = auto()
     SLASH = auto()
+    AMP = auto()      # &     bitwise AND
+    PIPE = auto()     # |     bitwise OR
+    CARET = auto()    # ^     bitwise XOR
+    TILDE = auto()    # ~     bitwise NOT
+    SHL = auto()      # <<    shift left
+    SHR = auto()      # >>    shift right
     NEWLINE = auto()
     EOF = auto()
 
@@ -43,6 +49,8 @@ KEYWORDS = {
     "length", "rows", "columns",
     "print",
     "true", "false", "none",
+    "bit_and", "bit_or", "bit_not",
+    "xor", "shifted", "left", "right",
 }
 
 
@@ -108,6 +116,17 @@ def tokenize(source: str) -> list[Token]:
             tokens.append(Token(TK.STRING, start, i))
             continue
 
+        # Two-char symbols first (so `<<` doesn't get split into two separate
+        # tokens and confused with comparison-like sequences).
+        if c == "<" and i + 1 < n and source[i + 1] == "<":
+            tokens.append(Token(TK.SHL, i, i + 2))
+            i += 2
+            continue
+        if c == ">" and i + 1 < n and source[i + 1] == ">":
+            tokens.append(Token(TK.SHR, i, i + 2))
+            i += 2
+            continue
+
         single = {
             "(": TK.LPAREN,
             ")": TK.RPAREN,
@@ -119,6 +138,10 @@ def tokenize(source: str) -> list[Token]:
             "-": TK.MINUS,
             "*": TK.STAR,
             "/": TK.SLASH,
+            "&": TK.AMP,
+            "|": TK.PIPE,
+            "^": TK.CARET,
+            "~": TK.TILDE,
         }
         if c in single:
             tokens.append(Token(single[c], i, i + 1))

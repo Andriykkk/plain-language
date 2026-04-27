@@ -250,6 +250,32 @@ def execute(module: Module) -> None:
             r_dst, r_a, r_b = operands
             registers[r_dst] = registers[r_a] >= registers[r_b]
 
+        # --- typed bitwise (integer-only, rejected on floats by compiler) ---
+
+        elif op is Opcode.BIT_AND_I8 or op is Opcode.BIT_AND_I32 or op is Opcode.BIT_AND_I64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] & registers[r_b]
+
+        elif op is Opcode.BIT_OR_I8 or op is Opcode.BIT_OR_I32 or op is Opcode.BIT_OR_I64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] | registers[r_b]
+
+        elif op is Opcode.BIT_XOR_I8 or op is Opcode.BIT_XOR_I32 or op is Opcode.BIT_XOR_I64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] ^ registers[r_b]
+
+        elif op is Opcode.BIT_NOT_I8 or op is Opcode.BIT_NOT_I32 or op is Opcode.BIT_NOT_I64:
+            r_dst, r_src = operands
+            registers[r_dst] = ~registers[r_src]
+
+        elif op is Opcode.SHL_I8 or op is Opcode.SHL_I32 or op is Opcode.SHL_I64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] << registers[r_b]
+
+        elif op is Opcode.SHR_I8 or op is Opcode.SHR_I32 or op is Opcode.SHR_I64:
+            r_dst, r_a, r_b = operands
+            registers[r_dst] = registers[r_a] >> registers[r_b]
+
         elif op is Opcode.PRINT:
             (r_src,) = operands
             sys.stdout.write(str(registers[r_src]))

@@ -42,8 +42,16 @@ class VarRef:
 @dataclass
 class BinaryOp:
     op: str  # "plus" | "minus" | "times" | "divided"
+             # | "bit_and" | "bit_or" | "bit_xor"
+             # | "shift_left" | "shift_right"
     left: "Expr"
     right: "Expr"
+
+
+@dataclass
+class UnaryOp:
+    op: str  # "bit_not"
+    operand: "Expr"
 
 
 @dataclass
@@ -109,9 +117,9 @@ class ColumnsExpr:
 
 
 Expr = Union[
-    NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, Compare, CallExpr,
-    FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap, EmptyMatrix,
-    LengthExpr, RowsExpr, ColumnsExpr,
+    NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, UnaryOp, Compare,
+    CallExpr, FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap,
+    EmptyMatrix, LengthExpr, RowsExpr, ColumnsExpr,
 ]
 
 
@@ -651,7 +659,7 @@ class Parser:
         return self.parse_comparison()
 
     def parse_comparison(self) -> Expr:
-        left = self.parse_addition()
+        left = self.parse_bit_or()
         if not self.match(TK.KEYWORD, "is"):
             return left
         self.advance()
@@ -692,8 +700,101 @@ class Parser:
                 f"expected comparison operator after 'is', got {self.text(tok)!r}", tok
             )
 
-        right = self.parse_addition()
+        right = self.parse_bit_or()
         return Compare(op, left, right)
+
+    # ----- bitwise levels -----
+    #
+    # Precedence (low → high), Python/C-style:
+    #     comparison
+    #     bit_or         |   bit or
+    #     bit_xor        ^   xor
+    #     bit_and        &   bit and
+    #     shift          <<  >>   shifted left/right by
+    #     addition       +   -    plus minus
+    #     ...
+    # All four of these only make sense on integers; the type check happens
+    # at compile time in compile_binop.
+
+    def parse_bit_or(self) -> Expr:
+        left = self.parse_bit_xor()
+        while True:
+            if self.match(TK.PIPE) or self.match(TK.KEYWORD, "bit_or"):
+                self.advance()
+                right = self.parse_bit_xor()
+                left = BinaryOp("bit_or", left, right)
+            else:
+                break
+        return left
+
+    def parse_bit_xor(self) -> Expr:
+        left = self.parse_bit_and()
+        while True:
+            if self.match(TK.CARET) or self.match(TK.KEYWORD, "xor"):
+                self.advance()
+                right = self.parse_bit_and()
+                left = BinaryOp("bit_xor", left, right)
+            else:
+                break
+        return left
+
+    def parse_bit_and(self) -> Expr:
+        left = self.parse_shift()
+        while True:
+            if self.match(TK.AMP) or self.match(TK.KEYWORD, "bit_and"):
+                self.advance()
+                right = self.parse_shift()
+                left = BinaryOp("bit_and", left, right)
+            else:
+                break
+        return left
+
+    def parse_shift(self) -> Expr:
+        left = self.parse_addition()
+        while True:
+            if self.match(TK.SHL):
+                self.advance()
+                right = self.parse_addition()
+                left = BinaryOp("shift_left", left, right)
+            elif self.match(TK.SHR):
+                self.advance()
+                right = self.parse_addition()
+                left = BinaryOp("shift_right", left, right)
+            elif self.match(TK.KEYWORD, "shifted"):
+                self.advance()
+                if self.match(TK.KEYWORD, "left"):
+                    self.advance()
+                    self.consume(TK.KEYWORD, "by")
+                    right = self.parse_addition()
+                    left = BinaryOp("shift_left", left, right)
+                elif self.match(TK.KEYWORD, "right"):
+                    self.advance()
+                    self.consume(TK.KEYWORD, "by")
+                    right = self.parse_addition()
+                    left = BinaryOp("shift_right", left, right)
+                else:
+                    tok = self.peek()
+                    raise ParseError(
+                        f"expected 'left' or 'right' after 'shifted', "
+                        f"got {self.text(tok)!r}", tok
+                    )
+            else:
+                break
+        return left
+
+    def _peek_kw_at(self, offset: int, text: str) -> bool:
+        """Look at the token `offset` positions ahead and check whether it's
+        a keyword with the given text. Used for two-keyword sequences like
+        `bit and`, `bit or`."""
+        idx = self.pos + offset
+        # Skip ignored newlines while inside brackets, mirroring `peek()`.
+        if self.bracket_depth > 0:
+            while idx < len(self.tokens) and self.tokens[idx].kind == TK.NEWLINE:
+                idx += 1
+        if idx >= len(self.tokens):
+            return False
+        tok = self.tokens[idx]
+        return tok.kind == TK.KEYWORD and self.text(tok) == text
 
     def parse_addition(self, allow_times: bool = True) -> Expr:
         left = self.parse_multiplication(allow_times)
@@ -741,6 +842,12 @@ class Parser:
             self.advance()
             inner = self.parse_primary()
             return BinaryOp("minus", NumberLit(0), inner)
+
+        # Bitwise NOT — both `~x` and `bit_not x`.
+        if self.match(TK.TILDE) or self.match(TK.KEYWORD, "bit_not"):
+            self.advance()
+            inner = self.parse_primary()
+            return UnaryOp("bit_not", inner)
 
         expr = self._parse_atom()
         while True:
