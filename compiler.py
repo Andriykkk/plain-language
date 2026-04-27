@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 
 from bytecode import FieldLayout, Instruction, Module, Opcode, RecordLayout, TypeCode
 from parser import (
-    AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, ColumnsExpr, Compare,
-    EmptyList, EmptyMatrix, FieldAccess, FieldLValue, FunctionDef, IfStmt,
-    IndexAccess, IndexLValue, LengthExpr, NewExpr, NoneLit, NumberLit,
+    AppendStmt, BinaryOp, BoolLit, CallExpr, CallStmt, Cast, ColumnsExpr,
+    Compare, EmptyList, EmptyMatrix, FieldAccess, FieldLValue, FunctionDef,
+    IfStmt, IndexAccess, IndexLValue, LengthExpr, NewExpr, NoneLit, NumberLit,
     PrintStmt, RecordDef, RepeatForEachStmt, RepeatRangeStmt, RepeatTimesStmt,
     RepeatWhileStmt, ReturnStmt, RowsExpr, SetStmt, SkipStmt, Stmt, StopStmt,
     StringLit, TypeRef, UnaryOp, VarLValue, VarRef,
@@ -1067,6 +1067,8 @@ class Compiler:
             return self._contains_call(expr.left) or self._contains_call(expr.right)
         if isinstance(expr, UnaryOp):
             return self._contains_call(expr.operand)
+        if isinstance(expr, Cast):
+            return self._contains_call(expr.value)
         if isinstance(expr, Compare):
             return self._contains_call(expr.left) or self._contains_call(expr.right)
         if isinstance(expr, IndexAccess):
@@ -1145,6 +1147,9 @@ class Compiler:
         if isinstance(expr, UnaryOp):
             return self.compile_unary(expr, reg)
 
+        if isinstance(expr, Cast):
+            return self.compile_cast(expr, reg)
+
         if isinstance(expr, Compare):
             return self.compile_compare(expr, reg)
 
@@ -1204,6 +1209,12 @@ class Compiler:
     def compile_binop(self, expr: BinaryOp, reg: int) -> TypeCode:
         """Typed arithmetic. Emits conversions for mixed types, then the
         typed ADD/SUB/MUL/DIV opcode."""
+        # Logical and/or short-circuit and don't fit the eval-both-then-op
+        # pattern of arithmetic — dispatch them out before evaluating
+        # operands.
+        if expr.op in ("logical_and", "logical_or"):
+            return self.compile_logical(expr, reg)
+
         left_reg  = reg + 1
         right_reg = reg + 2
 
@@ -1257,19 +1268,197 @@ class Compiler:
         return result_type
 
     def compile_unary(self, expr: UnaryOp, reg: int) -> TypeCode:
-        """Currently only `bit_not` (`~x` and `bit not x`)."""
-        if expr.op != "bit_not":
-            raise CompileError(f"unsupported unary op: {expr.op}")
-        operand_reg = reg + 1
-        operand_type = self.compile_expr_into(expr.operand, operand_reg)
-        if operand_type not in INTEGER_TYPES:
-            raise CompileError(
-                f"bitwise 'not' requires an integer operand, got "
-                f"{operand_type.name}"
+        """`bit_not` (`~`/`bit_not`) and `logical_not` (`!`/`not`)."""
+        if expr.op == "bit_not":
+            operand_reg = reg + 1
+            operand_type = self.compile_expr_into(expr.operand, operand_reg)
+            if operand_type not in INTEGER_TYPES:
+                raise CompileError(
+                    f"bitwise 'not' requires an integer operand, got "
+                    f"{operand_type.name}"
+                )
+            opcode = _BIT_NOT_OPCODES[operand_type]
+            self.emit(opcode, (reg, operand_reg))
+            return operand_type
+
+        if expr.op == "logical_not":
+            operand_type = self.compile_expr_into(expr.operand, reg)
+            # Convert to BOOL via truthiness, then flip via NE_BOOL with True.
+            self.emit_truthy(operand_type, src_reg=reg, dst_reg=reg, scratch=reg + 1)
+            true_addr = self.allocate_constant(True)
+            self.emit(Opcode.LOAD, (reg + 1, true_addr))
+            self.emit(Opcode.NE_BOOL, (reg, reg, reg + 1))
+            return TypeCode.BOOL
+
+        raise CompileError(f"unsupported unary op: {expr.op}")
+
+    # ----- type cast: `<expr> as <type>` and `<type>(<expr>)` -----
+
+    def compile_cast(self, expr: Cast, reg: int) -> TypeCode:
+        """Compile a type cast. Conversion rules:
+          - same type            → no-op
+          - numeric → numeric    → existing CVT_* opcodes
+          - any → BOOL           → truthiness check
+          - BOOL → numeric       → trivial (Python's bool is int subclass)
+          - other combinations   → compile error
+        """
+        src_type = self.compile_expr_into(expr.value, reg)
+        dst_type = self.typeref_to_code(expr.target_type)
+        if src_type == dst_type:
+            return dst_type
+        if dst_type == TypeCode.BOOL:
+            self.emit_truthy(src_type, src_reg=reg, dst_reg=reg, scratch=reg + 1)
+            return TypeCode.BOOL
+        if src_type == TypeCode.BOOL and dst_type in NUMERIC_TYPES:
+            # In Python, True/False ARE int (1/0). The value already
+            # behaves correctly under any numeric opcode; no conversion
+            # instruction needed. A C port would emit a zero-extend here.
+            return dst_type
+        if src_type in NUMERIC_TYPES and dst_type in NUMERIC_TYPES:
+            self.emit_convert(src_type, dst_type, src=reg, dst=reg)
+            return dst_type
+        raise CompileError(
+            f"cannot cast {src_type.name} to {dst_type.name}"
+        )
+
+    # ----- truthiness check (for cast-to-bool, logical short-circuit) -----
+
+    _NE_OP_FOR_TYPE = {
+        TypeCode.I8:  Opcode.NE_I8,
+        TypeCode.I32: Opcode.NE_I32,
+        TypeCode.I64: Opcode.NE_I64,
+        TypeCode.F32: Opcode.NE_F32,
+        TypeCode.F64: Opcode.NE_F64,
+    }
+
+    def emit_truthy(self, src_type: TypeCode, src_reg: int,
+                    dst_reg: int, scratch: int) -> None:
+        """Emit code that places a BOOL in `dst_reg` representing the
+        truthiness of the value in `src_reg`. `scratch` (and possibly
+        scratch+1 for TEXT/REF) are used to hold the comparison constant.
+        `src_reg` and `dst_reg` may be the same; the source is read before
+        the result is written.
+        """
+        if src_type == TypeCode.BOOL:
+            if src_reg == dst_reg:
+                return
+            # Copy via NE-with-False (no MOV opcode in this VM).
+            false_addr = self.allocate_constant(False)
+            self.emit(Opcode.LOAD, (scratch, false_addr))
+            self.emit(Opcode.NE_BOOL, (dst_reg, src_reg, scratch))
+            return
+
+        if src_type in NUMERIC_TYPES:
+            # truthy == (value != 0)
+            zero_value = 0 if src_type in INTEGER_TYPES else 0.0
+            zero_addr = self.allocate_constant(zero_value)
+            self.emit(Opcode.LOAD, (scratch, zero_addr))
+            self.emit(self._NE_OP_FOR_TYPE[src_type], (dst_reg, src_reg, scratch))
+            return
+
+        if src_type == TypeCode.TEXT or src_type == TypeCode.REF:
+            # truthy == (length > 0)
+            zero_addr = self.allocate_constant(0)
+            self.emit(Opcode.LEN, (scratch, src_reg))
+            self.emit(Opcode.LOAD, (scratch + 1, zero_addr))
+            self.emit(Opcode.GT_I64, (dst_reg, scratch, scratch + 1))
+            return
+
+        if src_type == TypeCode.NONE:
+            false_addr = self.allocate_constant(False)
+            self.emit(Opcode.LOAD, (dst_reg, false_addr))
+            return
+
+        raise CompileError(
+            f"cannot test truthiness of {src_type.name}"
+        )
+
+    # ----- logical and/or — Python-style with short-circuit -----
+
+    def compile_logical(self, expr: BinaryOp, reg: int) -> TypeCode:
+        """`a and b`: returns a if falsy, else b. `a or b`: returns a if
+        truthy, else b. Both short-circuit the right operand.
+
+        Result type rules:
+          - same types  → that type (Python's "return chosen operand")
+          - both numeric → promoted common type
+          - otherwise   → collapse to BOOL via truthiness in both branches
+
+        The third rule covers the common idiom `xs and xs[0]` (REF and I64,
+        no common static type) — the result is a BOOL that's true iff the
+        whole chain is truthy. Same effective behavior as Python in
+        boolean contexts; you lose Python's exact "return the operand"
+        when types are unrelated, but that's the price of static typing.
+        """
+        # 1. Compile left into reg. Stays here for the short-circuit branch.
+        left_type = self.compile_expr_into(expr.left, reg)
+
+        # 2. Truthiness test of left → reg+1.
+        self.emit_truthy(left_type, src_reg=reg, dst_reg=reg + 1,
+                         scratch=reg + 2)
+
+        # 3. Conditional jump that goes to the "left-chosen" tail (placeholder).
+        if expr.op == "logical_and":
+            # Left determines (chosen) if FALSY.
+            skip_right_idx = self.emit_placeholder_jump(
+                Opcode.JMPF, r_cond=reg + 1
             )
-        opcode = _BIT_NOT_OPCODES[operand_type]
-        self.emit(opcode, (reg, operand_reg))
-        return operand_type
+        else:
+            # logical_or — left determines if TRUTHY.
+            skip_right_idx = self.emit_placeholder_jump(
+                Opcode.JMPT, r_cond=reg + 1
+            )
+
+        # 4. Compile right, overwriting reg.
+        right_type = self.compile_expr_into(expr.right, reg)
+
+        # 5. Pick the result type now that we know both operand types.
+        if left_type == right_type:
+            result_type = left_type
+        elif left_type in NUMERIC_TYPES and right_type in NUMERIC_TYPES:
+            result_type = _PROMOTE[(left_type, right_type)]
+        else:
+            result_type = TypeCode.BOOL
+
+        # 6. Convert the right value (currently in reg) to result_type.
+        self._convert_to(right_type, result_type, reg)
+
+        # 7. Unconditional jump past the left-conversion section.
+        end_idx = self.emit_placeholder_jump(Opcode.JMP)
+
+        # 8. Land here when left was chosen — reg still holds left's value.
+        self.patch_jmp_target(skip_right_idx, self.current_pos())
+
+        # 9. Convert the left value to result_type.
+        self._convert_to(left_type, result_type, reg)
+
+        # 10. Convergence point — both branches end here with reg holding
+        #     a value of result_type.
+        self.patch_jmp_target(end_idx, self.current_pos())
+
+        return result_type
+
+    def _convert_to(self, from_type: TypeCode, to_type: TypeCode,
+                    reg: int) -> None:
+        """In-place type conversion in `reg`, used by logical-op's branch
+        unification. Same conversion rules as `compile_cast` but reusable
+        without an AST node. Uses reg+1 as scratch when emitting truthiness."""
+        if from_type == to_type:
+            return
+        if to_type == TypeCode.BOOL:
+            self.emit_truthy(from_type, src_reg=reg, dst_reg=reg,
+                             scratch=reg + 1)
+            return
+        if from_type == TypeCode.BOOL and to_type in NUMERIC_TYPES:
+            # Python's bool is int subclass — no instruction needed.
+            return
+        if from_type in NUMERIC_TYPES and to_type in NUMERIC_TYPES:
+            self.emit_convert(from_type, to_type, src=reg, dst=reg)
+            return
+        # No defined path — leave the value as-is. This branch is only
+        # reachable when result_type was set to BOOL above (in which case
+        # the to_type==BOOL branch handled it), so in practice this is
+        # unreached.
 
     def compile_compare(self, expr: Compare, reg: int) -> TypeCode:
         """Typed comparison. Same promotion rules as arithmetic for numeric
@@ -1317,12 +1506,13 @@ class Compiler:
         each nested IfStmt emits its own jumps that get patched at its own
         end, propagating outward.
         """
-        # Compile the condition into r0.
+        # Compile the condition into r0. Non-BOOL conditions are
+        # implicitly truthy-checked — `if xs ...` works for lists,
+        # `if count ...` for integers, etc. Same Python-style ergonomics
+        # as logical and/or.
         cond_type = self.compile_expr_into(stmt.condition, reg=0)
         if cond_type != TypeCode.BOOL:
-            raise CompileError(
-                f"if condition must be BOOL, got {cond_type.name}"
-            )
+            self.emit_truthy(cond_type, src_reg=0, dst_reg=0, scratch=1)
 
         # Emit JMPF to a placeholder — patched either to the else branch
         # (if there is one) or to the position after the then-body.
@@ -1402,9 +1592,8 @@ class Compiler:
         def cond() -> int:
             cond_type = self.compile_expr_into(stmt.condition, reg=0)
             if cond_type != TypeCode.BOOL:
-                raise CompileError(
-                    f"while condition must be BOOL, got {cond_type.name}"
-                )
+                # Implicit truthiness — same as `if`.
+                self.emit_truthy(cond_type, src_reg=0, dst_reg=0, scratch=1)
             return 0
         self.compile_loop(cond_emit=cond, post_emit=None, body=stmt.body)
 

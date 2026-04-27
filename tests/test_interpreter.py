@@ -33,7 +33,7 @@ class TestLiterals(unittest.TestCase):
 
     def test_booleans_and_none(self):
         self.assertEqual(
-            run_capture("print true and false and none\n"),
+            run_capture("print true, false, none\n"),
             "True False None\n",
         )
 
@@ -156,7 +156,7 @@ print x
 class TestPrint(unittest.TestCase):
     def test_print_joins_with_and(self):
         self.assertEqual(
-            run_capture('set x to 42\nprint "answer is" and x\n'),
+            run_capture('set x to 42\nprint "answer is", x\n'),
             "answer is 42\n",
         )
 
@@ -402,7 +402,7 @@ print call double with 21
     return a plus b plus c
 end
 
-print call add3 with 1 and 2 and 3
+print call add3 with 1, 2, 3
 """
         self.assertEqual(run_capture(src), "6.0\n")
 
@@ -410,7 +410,7 @@ print call add3 with 1 and 2 and 3
         src = """define function greet
     input name as text
 
-    print "hello" and name
+    print "hello", name
 end
 
 call greet with "world"
@@ -541,7 +541,7 @@ class TestFunctionErrors(unittest.TestCase):
     return x
 end
 
-print call f with 1 and 2
+print call f with 1, 2
 """
         with self.assertRaises(RunError):
             run_capture(src)
@@ -568,7 +568,7 @@ end
 set u to new Person
 set u.name to "Alice"
 set u.age to 30
-print u.name and u.age
+print u.name, u.age
 """
         self.assertEqual(run_capture(src), "Alice 30\n")
 
@@ -581,7 +581,7 @@ end
 set u to new Person
 set u.name to "Alice"
 set u.age to 30
-print u.name and u.age
+print u.name, u.age
 """
         self.assertEqual(run_capture(src), "Alice 30.0\n")
 
@@ -984,6 +984,326 @@ end
 print total
 """
         self.assertEqual(run_capture(src), "apple\n5.0\n7\n")
+
+
+class TestBitwise(unittest.TestCase):
+    # symbol forms
+
+    def test_bit_and_symbol(self):
+        self.assertEqual(run_capture("print 12 & 10\n"), "8\n")
+
+    def test_bit_or_symbol(self):
+        self.assertEqual(run_capture("print 12 | 10\n"), "14\n")
+
+    def test_bit_xor_symbol(self):
+        self.assertEqual(run_capture("print 12 ^ 10\n"), "6\n")
+
+    def test_bit_not_symbol(self):
+        self.assertEqual(run_capture("print ~ 0\n"), "-1\n")
+
+    def test_shift_left_symbol(self):
+        self.assertEqual(run_capture("print 1 << 4\n"), "16\n")
+
+    def test_shift_right_symbol(self):
+        self.assertEqual(run_capture("print 256 >> 2\n"), "64\n")
+
+    # word forms
+
+    def test_bit_and_word(self):
+        self.assertEqual(run_capture("print 12 bit_and 10\n"), "8\n")
+
+    def test_bit_or_word(self):
+        self.assertEqual(run_capture("print 12 bit_or 10\n"), "14\n")
+
+    def test_bit_xor_word(self):
+        self.assertEqual(run_capture("print 12 xor 10\n"), "6\n")
+
+    def test_bit_not_word(self):
+        self.assertEqual(run_capture("print bit_not 0\n"), "-1\n")
+
+    def test_shifted_left_word(self):
+        self.assertEqual(run_capture("print 1 shifted left by 4\n"), "16\n")
+
+    def test_shifted_right_word(self):
+        self.assertEqual(
+            run_capture("print 256 shifted right by 2\n"), "64\n"
+        )
+
+    # combined / precedence
+
+    def test_or_xor_and_precedence(self):
+        # AND binds tighter than XOR which binds tighter than OR.
+        # 12 & 10 = 8; 8 ^ 5 = 13; 13 | 1 = 13.
+        self.assertEqual(run_capture("print 12 & 10 ^ 5 | 1\n"), "13\n")
+
+    def test_shift_higher_than_arithmetic_bitwise_lower(self):
+        # 1 << 3 = 8; (5 + 8) & 0xF = 13.
+        self.assertEqual(run_capture("print 5 + 1 << 3 & 15\n"), "13\n")
+
+    # error cases
+
+    def test_bitwise_rejects_float(self):
+        with self.assertRaises(RunError):
+            run_capture("print 1.5 & 2\n")
+
+    def test_bitwise_rejects_float_with_word_form(self):
+        with self.assertRaises(RunError):
+            run_capture("set x to 3.14\nprint x bit_and 1\n")
+
+    def test_bit_not_rejects_float(self):
+        with self.assertRaises(RunError):
+            run_capture("print bit_not 3.14\n")
+
+
+class TestLogical(unittest.TestCase):
+    # Python-style: return the chosen operand when types match.
+
+    def test_and_returns_left_when_falsy(self):
+        self.assertEqual(run_capture("print 0 and 5\n"), "0\n")
+
+    def test_and_returns_right_when_left_truthy(self):
+        self.assertEqual(run_capture("print 5 and 3\n"), "3\n")
+
+    def test_or_returns_left_when_truthy(self):
+        self.assertEqual(run_capture("print 5 or 3\n"), "5\n")
+
+    def test_or_returns_right_when_left_falsy(self):
+        self.assertEqual(run_capture("print 0 or 5\n"), "5\n")
+
+    def test_or_returns_falsy_right_if_left_falsy(self):
+        self.assertEqual(run_capture("print 0 or 0\n"), "0\n")
+
+    # Word and symbol forms are equivalent.
+
+    def test_double_amp_same_as_and(self):
+        self.assertEqual(run_capture("print 5 && 3\n"), "3\n")
+
+    def test_double_pipe_same_as_or(self):
+        self.assertEqual(run_capture("print 0 || 5\n"), "5\n")
+
+    def test_bang_same_as_not(self):
+        self.assertEqual(run_capture("print !5\n"), "False\n")
+        self.assertEqual(run_capture("print !0\n"), "True\n")
+
+    # Default-value idiom on TEXT.
+
+    def test_or_default_text(self):
+        src = """set name to ""
+print name or "anonymous"
+"""
+        self.assertEqual(run_capture(src), "anonymous\n")
+
+    def test_or_keeps_non_empty_text(self):
+        src = """set name to "Alice"
+print name or "anonymous"
+"""
+        self.assertEqual(run_capture(src), "Alice\n")
+
+    # Mixed types collapse to BOOL via truthiness.
+
+    def test_and_mixed_types_collapses_to_bool(self):
+        src = """set xs to empty list of i64
+print xs and xs[0]
+"""
+        self.assertEqual(run_capture(src), "False\n")
+
+    def test_and_mixed_types_truthy_path(self):
+        src = """set xs to empty list of i64
+append 42 to xs
+print xs and xs[0]
+"""
+        self.assertEqual(run_capture(src), "True\n")
+
+    # Short-circuit: right side not evaluated when left determines.
+
+    def test_short_circuit_and_skips_right_on_falsy_left(self):
+        # If 'and' didn't short-circuit, xs[0] on an empty list would throw
+        # an out-of-range error. It should compile to a BOOL = False.
+        src = """set xs to empty list of i64
+print xs and xs[0]
+"""
+        self.assertEqual(run_capture(src), "False\n")
+
+    def test_short_circuit_or_skips_right_on_truthy_left(self):
+        # 5 or (1/0) — right would crash, so the test passing means we
+        # didn't evaluate it.
+        self.assertEqual(run_capture("print 5 or (1 / 0)\n"), "5\n")
+
+    # not / !
+
+    def test_not_true(self):
+        self.assertEqual(run_capture("print not true\n"), "False\n")
+
+    def test_not_false(self):
+        self.assertEqual(run_capture("print not false\n"), "True\n")
+
+    def test_not_zero_is_true(self):
+        self.assertEqual(run_capture("print not 0\n"), "True\n")
+
+    def test_not_nonzero_is_false(self):
+        self.assertEqual(run_capture("print not 5\n"), "False\n")
+
+    def test_not_empty_text_is_true(self):
+        self.assertEqual(run_capture('print not ""\n'), "True\n")
+
+    def test_not_nonempty_text_is_false(self):
+        self.assertEqual(run_capture('print not "x"\n'), "False\n")
+
+    def test_not_empty_list_is_true(self):
+        src = """set xs to empty list of i64
+print not xs
+"""
+        self.assertEqual(run_capture(src), "True\n")
+
+    def test_not_nonempty_list_is_false(self):
+        src = """set xs to empty list of i64
+append 1 to xs
+print not xs
+"""
+        self.assertEqual(run_capture(src), "False\n")
+
+    # if/while accept any-typed conditions via implicit truthiness.
+
+    def test_if_with_int_condition(self):
+        src = """set x to 5
+if x
+    print "truthy"
+else
+    print "falsy"
+end
+"""
+        self.assertEqual(run_capture(src), "truthy\n")
+
+    def test_if_with_zero_int_is_falsy(self):
+        src = """set x to 0
+if x
+    print "truthy"
+else
+    print "falsy"
+end
+"""
+        self.assertEqual(run_capture(src), "falsy\n")
+
+    def test_if_with_text_condition(self):
+        src = """set s to ""
+if s
+    print "truthy"
+else
+    print "falsy"
+end
+"""
+        self.assertEqual(run_capture(src), "falsy\n")
+
+    def test_if_with_logical_chain(self):
+        src = """set x to 5
+set y to 3
+if x is greater than 0 and y is greater than 0
+    print "both positive"
+end
+"""
+        self.assertEqual(run_capture(src), "both positive\n")
+
+    def test_while_with_int_condition(self):
+        src = """set n to 3
+repeat while n
+    print n
+    subtract 1 from n
+end
+"""
+        self.assertEqual(run_capture(src), "3\n2\n1\n")
+
+    # Compound combinations.
+
+    def test_and_or_precedence(self):
+        # AND binds tighter than OR. `0 or 1 and 0` = `0 or (1 and 0)` = `0 or 0` = `0`.
+        self.assertEqual(run_capture("print 0 or 1 and 0\n"), "0\n")
+
+    def test_chained_or_returns_first_truthy(self):
+        self.assertEqual(run_capture("print 0 or 0 or 7 or 0\n"), "7\n")
+
+    def test_chained_and_returns_first_falsy(self):
+        self.assertEqual(run_capture("print 5 and 0 and 7\n"), "0\n")
+
+
+class TestCast(unittest.TestCase):
+    # Postfix `as <type>`
+
+    def test_int_to_bool_truthy(self):
+        self.assertEqual(run_capture("print 5 as bool\n"), "True\n")
+
+    def test_int_to_bool_falsy(self):
+        self.assertEqual(run_capture("print 0 as bool\n"), "False\n")
+
+    def test_text_to_bool_empty(self):
+        self.assertEqual(run_capture('print "" as bool\n'), "False\n")
+
+    def test_text_to_bool_non_empty(self):
+        self.assertEqual(run_capture('print "x" as bool\n'), "True\n")
+
+    def test_float_to_int_truncates(self):
+        self.assertEqual(run_capture("print 3.7 as i64\n"), "3\n")
+
+    def test_negative_float_to_int_truncates(self):
+        self.assertEqual(run_capture("print -3.7 as i64\n"), "-3\n")
+
+    def test_int_to_float(self):
+        self.assertEqual(run_capture("print 5 as f64\n"), "5.0\n")
+
+    def test_bool_to_int(self):
+        self.assertEqual(run_capture("print true as i64\n"), "1\n")
+        self.assertEqual(run_capture("print false as i64\n"), "0\n")
+
+    def test_bool_to_bool_no_op(self):
+        self.assertEqual(run_capture("print true as bool\n"), "True\n")
+
+    # Prefix `<type>(<expr>)` — equivalent to postfix `as`.
+
+    def test_bool_call_form(self):
+        self.assertEqual(run_capture("print bool(5)\n"), "True\n")
+        self.assertEqual(run_capture("print bool(0)\n"), "False\n")
+        self.assertEqual(run_capture('print bool("")\n'), "False\n")
+
+    def test_i64_call_form(self):
+        self.assertEqual(run_capture("print i64(3.7)\n"), "3\n")
+        self.assertEqual(run_capture("print i64(true)\n"), "1\n")
+
+    def test_f64_call_form(self):
+        self.assertEqual(run_capture("print f64(5)\n"), "5.0\n")
+
+    # Precedence — `as` is the lowest-precedence operator.
+
+    def test_as_lower_than_logical_and(self):
+        # `5 and 3 as bool` parses as `(5 and 3) as bool`.
+        self.assertEqual(run_capture("print 5 and 3 as bool\n"), "True\n")
+
+    def test_as_lower_than_logical_or(self):
+        self.assertEqual(run_capture("print 0 or 0 as bool\n"), "False\n")
+
+    def test_as_lower_than_arithmetic(self):
+        # `2 + 3 as f64` → `(2 + 3) as f64` = 5.0.
+        self.assertEqual(run_capture("print 2 + 3 as f64\n"), "5.0\n")
+
+    def test_explicit_paren_casts_one_operand(self):
+        # `5 and (3 as bool)` casts the 3 to True; result of `5 and True` is True.
+        self.assertEqual(run_capture("print 5 and (3 as bool)\n"), "True\n")
+
+    # Cast chains
+
+    def test_cast_chain(self):
+        # `3.7 as i64 as f64` = `((3.7 as i64) as f64)` = 3.0
+        self.assertEqual(run_capture("print 3.7 as i64 as f64\n"), "3.0\n")
+
+    # The two surface forms are equivalent.
+
+    def test_postfix_and_call_forms_match_for_bool(self):
+        a = run_capture("print 7 as bool\n")
+        b = run_capture("print bool(7)\n")
+        self.assertEqual(a, b)
+
+    def test_postfix_and_call_forms_match_for_i64(self):
+        a = run_capture("print 4.9 as i64\n")
+        b = run_capture("print i64(4.9)\n")
+        self.assertEqual(a, b)
 
 
 class TestErrors(unittest.TestCase):

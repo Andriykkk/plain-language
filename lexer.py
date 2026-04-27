@@ -23,6 +23,9 @@ class TK(Enum):
     TILDE = auto()    # ~     bitwise NOT
     SHL = auto()      # <<    shift left
     SHR = auto()      # >>    shift right
+    DOUBLE_AMP = auto()    # &&   logical AND
+    DOUBLE_PIPE = auto()   # ||   logical OR
+    BANG = auto()          # !    logical NOT
     NEWLINE = auto()
     EOF = auto()
 
@@ -43,7 +46,7 @@ KEYWORDS = {
     "repeat", "for", "each", "in", "while",
     "stop", "skip",
     "define", "function", "record", "input", "output", "return",
-    "call", "with", "and",
+    "call", "with", "and", "or",
     "new", "empty", "list", "map", "matrix", "of",
     "append",
     "length", "rows", "columns",
@@ -126,6 +129,14 @@ def tokenize(source: str) -> list[Token]:
             tokens.append(Token(TK.SHR, i, i + 2))
             i += 2
             continue
+        if c == "&" and i + 1 < n and source[i + 1] == "&":
+            tokens.append(Token(TK.DOUBLE_AMP, i, i + 2))
+            i += 2
+            continue
+        if c == "|" and i + 1 < n and source[i + 1] == "|":
+            tokens.append(Token(TK.DOUBLE_PIPE, i, i + 2))
+            i += 2
+            continue
 
         single = {
             "(": TK.LPAREN,
@@ -142,6 +153,7 @@ def tokenize(source: str) -> list[Token]:
             "|": TK.PIPE,
             "^": TK.CARET,
             "~": TK.TILDE,
+            "!": TK.BANG,
         }
         if c in single:
             tokens.append(Token(single[c], i, i + 1))

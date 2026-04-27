@@ -1,6 +1,6 @@
 # PlainLang Surface Syntax — v0.1
 
-COBOL/ABC-blended syntax. One way per thing — no alternative phrasings of the same operation. Word-based operators throughout; `.` is the only symbol that survives in core syntax.
+COBOL/ABC-blended syntax. One way per thing — no alternative phrasings of the same operation. Word-based operators throughout; `.` is the only symbol that survives in core syntax. Math-flavored code can opt into the symbol forms (`+ - * /`, bitwise, comparisons) where word forms get heavy.
 
 ---
 
@@ -60,7 +60,7 @@ Only one statement form per situation — `add 5 to total` has no expression-for
 
 ### Word operators and symbol operators
 
-Expressions accept both word and symbol forms for arithmetic; the AST is identical either way.
+Expressions accept both word and symbol forms; the AST is identical either way.
 
 | Word form       | Symbol | Example             |
 |-----------------|--------|---------------------|
@@ -80,8 +80,6 @@ repeat for i from 0 to n - 1          # cleaner than 'n minus 1'
 set last to xs[length of xs - 1]
 set area to width * height
 ```
-
-**Comparisons** are still word-only for now: `is equal to`, `is greater than`, etc. Symbolic forms (`<`, `>`, `==`, `!=`, `<=`, `>=`) are a deliberate future addition, not a current gap.
 
 ---
 
@@ -104,9 +102,110 @@ if total is greater than 100
 end
 ```
 
+Symbolic comparison forms (`<`, `>`, `==`, `!=`, `<=`, `>=`) are a deliberate future addition, not a current gap.
+
 ---
 
-## 5. Branches
+## 5. Boolean logic — `and`, `or`, `not`
+
+For combining boolean conditions inside `if`, `while`, etc.:
+
+```
+if x is greater than 0 and y is less than 10
+    print "in range"
+end
+
+if name is equal to "" or name is equal to "guest"
+    print "anonymous"
+end
+
+if not (x is equal to 0)
+    print "non-zero"
+end
+```
+
+Symbol forms are accepted too — pick whichever reads better for your code:
+
+| Word form | Symbol |
+|-----------|--------|
+| `and`     | `&&`   |
+| `or`      | `\|\|` |
+| `not`     | `!`    |
+
+`not` / `!` is prefix; `and` / `&&` and `or` / `||` are infix.
+
+### Operands and result
+
+`and` / `or` accept any operands that share a common type:
+- both BOOL
+- both numeric (different widths get promoted, e.g. i8 + i64 → i64)
+- both TEXT
+- both REF (lists, matrices, record pointers)
+
+Operands of *unrelated* types (`i64 and text`, `bool or i64`, …) are a compile error. The result has the common type of the operands.
+
+### Truthiness
+
+When operands aren't already BOOL, they're treated as truthy/falsy by their natural test:
+
+| Type     | Falsy when         |
+|----------|--------------------|
+| BOOL     | `false`            |
+| numeric  | `0` (or `0.0`)     |
+| TEXT     | empty (`length` 0) |
+| REF      | empty / `none`     |
+| NONE     | always             |
+
+### Short-circuit and Python-style return value
+
+`and` / `or` are short-circuit: the right operand is not evaluated when the left already determines the answer. They return the *value* of the chosen operand, not a generic bool — Python semantics:
+
+```
+set name to user_name or "anonymous"          # default-when-empty
+set first_char to name and name[0]            # only index when name is non-empty
+```
+
+`a and b` returns `a` if `a` is falsy, otherwise `b`. `a or b` returns `a` if `a` is truthy, otherwise `b`. The result is type-stable because both operands are guaranteed to share a common type.
+
+### Don't confuse logical and bitwise
+
+| | Logical | Bitwise |
+|-|---------|---------|
+| AND | `and`, `&&` | `bit_and`, `&` |
+| OR | `or`, `\|\|` | `bit_or`, `\|` |
+| NOT | `not`, `!` | `bit_not`, `~` |
+| XOR | (rare; use `is not equal to`) | `xor`, `^` |
+
+Logical ops short-circuit and care about truthiness. Bitwise ops always evaluate both operands and only accept integers.
+
+---
+
+## 5b. Bitwise — integers only
+
+For low-level bit manipulation. Both word and symbol forms work:
+
+| Word form       | Symbol | Example             |
+|-----------------|--------|---------------------|
+| `bit_and`       | `&`    | `flags bit_and mask` |
+| `bit_or`        | `\|`   | `flags \| new_flag` |
+| `xor`           | `^`    | `a xor b`           |
+| `bit_not`       | `~`    | `bit_not value`     |
+| `shifted left by`  | `<<`   | `1 << 8` |
+| `shifted right by` | `>>`   | `value shifted right by 4` |
+
+Bitwise ops require **integer operands**; passing a float is a compile error. Mixed-width integers are promoted to the wider type (i8 + i64 → i64).
+
+Precedence (low → high): comparison < `bit_or` (`|`) < `xor` (`^`) < `bit_and` (`&`) < shift (`<< >>`) < addition < multiplication. Matches Python and C. When mixing with arithmetic, parenthesize for clarity.
+
+```
+set masked to value bit_and 0x_FF
+set high_byte to (value shifted right by 8) bit_and 0x_FF
+set toggled to flags xor (1 << bit_index)
+```
+
+---
+
+## 6. Branches
 
 ```
 if total is greater than 100
@@ -144,7 +243,7 @@ The valid kinds are `if`, `repeat`, `function`, `record`.
 
 ---
 
-## 6. Loops — four distinct idioms
+## 7. Loops — four distinct idioms
 
 ```
 repeat 10 times
@@ -185,7 +284,7 @@ repeat (2 times 3) times   # 6 iterations — parens needed
 
 ---
 
-## 7. Functions
+## 8. Functions
 
 Definition:
 
@@ -208,10 +307,11 @@ Call:
 set result to call calculate_total with prices
 ```
 
-`call ... with ...` is the universal function-call form. Multiple arguments separated by `and`:
+`call ... with ...` is the universal function-call form. Multiple arguments are separated by **commas**:
 
 ```
-set area to call rectangle_area with width and height
+set area to call rectangle_area with width, height
+set greeting to call format_name with first, middle, last
 ```
 
 No arguments:
@@ -220,11 +320,13 @@ No arguments:
 set now to call current_time
 ```
 
-Single-word function names for v1. Multi-word names via the pattern system (see `design-notes.md` §5) come later.
+`and` is reserved for boolean logic and never appears in argument lists; the comma is the only separator. This frees `and` to mean "logical AND" everywhere it appears in an expression.
+
+Single-word function names for v1. Multi-word names via the pattern system (see `extension-system.md`) come later.
 
 ---
 
-## 8. Records (structs)
+## 9. Records (structs)
 
 ```
 define record Person
@@ -241,9 +343,11 @@ add 100 to user.balance
 
 Field access uses `.` — the one symbol that survived.
 
+Records may contain other records as fields; nested records are stored **inline** (not as pointers), so `person.address.zip` is a chain of compile-time offsets, not a chain of pointer dereferences.
+
 ---
 
-## 9. Lists and maps
+## 10. Lists and maps
 
 ```
 set prices to empty list of number
@@ -259,9 +363,11 @@ set bob_age to ages["Bob"]
 
 Indexing is **0-based**: the first element is `xs[0]`, the last is `xs[(length of xs) minus 1]`. Same convention as C, Python, Rust — closer to how memory works, and avoids subtle off-by-one errors when doing index math. To iterate a list of length `n` by index: `repeat for i from 0 to n minus 1`.
 
+Lists of records store the records **inline**. `length of xs` returns the number of records, not the number of slots. `xs[i].field` reads the field's slot directly via offset arithmetic — no per-element pointer indirection.
+
 ---
 
-## 9b. Matrices — fixed-shape, N-dimensional
+## 10b. Matrices — fixed-shape, N-dimensional
 
 Use `matrix` when you want a grid with fixed dimensions and contiguous storage, not a jagged list-of-lists. Indexing uses a single bracket pair with comma-separated indices, COBOL-style.
 
@@ -298,7 +404,7 @@ Rules:
 - **0-indexed.** `m[0, 0]` is the first cell; matches `list[0]`.
 - **Row-major storage.** Under the hood, one flat buffer. A future compiler can swap in SIMD/GPU loops without changing your code.
 - **Any element type.** `matrix ... of number`, `matrix ... of text`, `matrix ... of Person` all work.
-- **Default values per type:** `number` → 0, `text` → `""`, record/other → `none`.
+- **Default values per type:** `number` → 0, `text` → `""`, record/other → recursively zeroed.
 - **Iteration.** `repeat for each v in m` visits every cell in row-major order. For per-row/per-column work, use nested `repeat for i from 0 to (rows of m) minus 1`.
 
 Matrices vs lists:
@@ -310,19 +416,20 @@ Pick the one that matches intent. Using a list-of-lists for a fixed grid is a co
 
 ---
 
-## 10. Output
+## 11. Output
 
 ```
 print "hello"
 print total
-print "total is" and total
+print "total is", total
+print "name:", user.name, "age:", user.age
 ```
 
-`and` in `print` joins values with a space.
+`print` joins its arguments with a single space and ends with one newline. Arguments are separated by **commas**, the same as in function calls. `and` is never used as a separator — it's reserved for boolean logic.
 
 ---
 
-## 11. Putting it together — a small real program
+## 12. Putting it together — a small real program
 
 ```
 define record Order
@@ -355,27 +462,30 @@ append o2 to orders
 
 set grand_total to call total_of with orders
 
-if grand_total is greater than 300
-    print "big order batch" and grand_total
+if grand_total is greater than 300 and length of orders is at least 2
+    print "big order batch", grand_total
 else
-    print "small batch" and grand_total
+    print "small batch", grand_total
 end
 ```
 
 ---
 
-## 12. Reserved word list (final — keep it small)
+## 13. Reserved word list
 
 ```
 set to as
 add subtract multiply divide by from
 plus minus times divided
 is equal not greater less than at least most
+and or                           # logical (also && and ||)
+bit_and bit_or bit_not xor       # bitwise (also & | ~ ^ << >>)
+shifted left right
 if else end
 repeat times for each in from to while
 stop skip
 define function record input output return
-call with and
+call with
 new empty list map matrix of
 append
 length rows columns
@@ -383,17 +493,18 @@ print
 true false none
 ```
 
-~45 words. Everything else is a user identifier or a user-defined operation.
+~55 words. Everything else is a user identifier or a user-defined operation.
+
+`and` is reserved for boolean logic only — never as a list/argument separator.
 
 ---
 
-## 13. What's explicitly *not* in v1
+## 14. What's explicitly *not* in v1
 
-- No operator symbols (`+ - * /`)
-- No alternative phrasings of the same op (`increase x by 5` rejected — use `add 5 to x`)
 - No anonymous functions / lambdas
 - No classes / inheritance (records only)
 - No modules / imports (single-file programs)
 - No exceptions (functions return a status, or you check before acting)
+- No symbolic comparison operators (`<`, `==`, etc.) — coming later
 
 Each of these can be added later without breaking v1 code.

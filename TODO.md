@@ -4,7 +4,10 @@
 [ ] add to vm map and 3d matrices
 [ ] add debuger and parser to show what types during coding
 [ ] add separate functions to compare lists, matrices, fill them, etc
-[ ] add divide everything for matrix and lists
+[ ] add divide everything for matrix and 
+[x] add "and" and "or"
+[ ] add pointer values, to set records to list and properly print them(special variable in compiler know pointer size)
+[ ] add type conversions
 [ ] add comptime list length check, not complex, just where it possible
 [ ] add more types https://www.youtube.com/watch?v=X40rcpLfMdY&list=WL&index=3&pp=iAQBsAgC
 [ ] add array of structures or structure of arrays to choose when allocate
@@ -14,7 +17,7 @@ All matrix element types go into a Python list right now. When you get to the C-
 Matrices are not growable (by design). If you later want appendable fixed-width rows, that's a different container (buffer? grid?) — don't overload matrix
 
 
-[ ] Bitwise ops on integers (and, or, xor, <<, >>) — not parsed yet in the language either.
+[X] Bitwise ops on integers (and, or, xor, <<, >>) — not parsed yet in the language either.
 Bitwise ops on integers — both C-style symbols and word forms supported.
 - Symbols: & | ^ ~ << >>
 - Words:   bit and / bit or / xor / bit not / shifted left by / shifted right by

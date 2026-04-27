@@ -50,8 +50,17 @@ class BinaryOp:
 
 @dataclass
 class UnaryOp:
-    op: str  # "bit_not"
+    op: str  # "bit_not" | "logical_not"
     operand: "Expr"
+
+
+@dataclass
+class Cast:
+    """Type cast — `<expr> as <type>` and `<type>(<expr>)` both produce
+    this node. Lower precedence than every binary operator, so the cast
+    applies to the whole expression to its left."""
+    value: "Expr"
+    target_type: TypeRef
 
 
 @dataclass
@@ -117,10 +126,20 @@ class ColumnsExpr:
 
 
 Expr = Union[
-    NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, UnaryOp, Compare,
-    CallExpr, FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap,
+    NumberLit, StringLit, BoolLit, NoneLit, VarRef, BinaryOp, UnaryOp, Cast,
+    Compare, CallExpr, FieldAccess, IndexAccess, NewExpr, EmptyList, EmptyMap,
     EmptyMatrix, LengthExpr, RowsExpr, ColumnsExpr,
 ]
+
+
+# Primitive type names accepted as the target of `as <type>` and as the
+# function-call-style cast form `<type>(<expr>)`. Aliases (`integer`,
+# `number`, `float`) resolve through the same compiler tables as
+# everywhere else.
+PRIMITIVE_TYPE_NAMES = frozenset({
+    "i8", "i32", "i64", "f32", "f64",
+    "integer", "float", "number", "bool", "text",
+})
 
 
 # ---------- AST: lvalues (assignment targets) ----------
@@ -461,7 +480,7 @@ class Parser:
     def parse_print(self) -> PrintStmt:
         self.consume(TK.KEYWORD, "print")
         parts = [self.parse_expression()]
-        while self.match(TK.KEYWORD, "and"):
+        while self.match(TK.COMMA):
             self.advance()
             parts.append(self.parse_expression())
         return PrintStmt(parts)
@@ -612,7 +631,7 @@ class Parser:
         if self.match(TK.KEYWORD, "with"):
             self.advance()
             args.append(self.parse_expression())
-            while self.match(TK.KEYWORD, "and"):
+            while self.match(TK.COMMA):
                 self.advance()
                 args.append(self.parse_expression())
         return CallExpr(name, args)
@@ -656,6 +675,60 @@ class Parser:
     # ---- expressions ----
 
     def parse_expression(self) -> Expr:
+        return self.parse_cast()
+
+    # ----- type cast -----
+    #
+    # `as` is the lowest-precedence operator: `a + b as i64` parses as
+    # `(a + b) as i64`. To cast a sub-expression, parenthesize:
+    # `(a as i64) + b`. Chains compose: `x as i32 as i64`.
+
+    def parse_cast(self) -> Expr:
+        expr = self.parse_logical_or()
+        while self.match(TK.KEYWORD, "as"):
+            self.advance()
+            type_ref = self.parse_type()
+            expr = Cast(expr, type_ref)
+        return expr
+
+    # ----- logical / / not -----
+    #
+    # Python-style: `and` / `or` short-circuit and return the chosen
+    # operand's value; `not` / `!` always returns BOOL. `&&` / `||` / `!`
+    # are pure spelling alternatives. Operands must share a common type
+    # (compile-time check).
+
+    def parse_logical_or(self) -> Expr:
+        left = self.parse_logical_and()
+        while True:
+            if self.match(TK.KEYWORD, "or") or self.match(TK.DOUBLE_PIPE):
+                self.advance()
+                right = self.parse_logical_and()
+                left = BinaryOp("logical_or", left, right)
+            else:
+                break
+        return left
+
+    def parse_logical_and(self) -> Expr:
+        left = self.parse_logical_not()
+        while True:
+            if self.match(TK.KEYWORD, "and") or self.match(TK.DOUBLE_AMP):
+                self.advance()
+                right = self.parse_logical_not()
+                left = BinaryOp("logical_and", left, right)
+            else:
+                break
+        return left
+
+    def parse_logical_not(self) -> Expr:
+        if self.match(TK.BANG):
+            self.advance()
+            return UnaryOp("logical_not", self.parse_logical_not())
+        # `not` as a prefix only when it isn't part of `is not equal to`
+        # (those are consumed inside parse_comparison after `is`).
+        if self.match(TK.KEYWORD, "not"):
+            self.advance()
+            return UnaryOp("logical_not", self.parse_logical_not())
         return self.parse_comparison()
 
     def parse_comparison(self) -> Expr:
@@ -904,8 +977,20 @@ class Parser:
             return StringLit(decode_string(self.text(tok)))
 
         if tok.kind == TK.IDENT:
+            name = self.text(tok)
+            # `<type>(<expr>)` — function-call-style cast, only when the
+            # identifier is a known primitive type name AND a `(` follows
+            # immediately. Otherwise it's a plain variable reference.
+            if name in PRIMITIVE_TYPE_NAMES \
+                    and self.pos + 1 < len(self.tokens) \
+                    and self.tokens[self.pos + 1].kind == TK.LPAREN:
+                self.advance()  # type name
+                self.advance()  # (
+                inner = self.parse_expression()
+                self.consume(TK.RPAREN)
+                return Cast(inner, TypeRef(name, []))
             self.advance()
-            return VarRef(self.text(tok))
+            return VarRef(name)
 
         if tok.kind == TK.LPAREN:
             self.advance()
