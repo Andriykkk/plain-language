@@ -894,7 +894,7 @@ print g[1, 0]
         self.assertEqual(run_capture(src), "12.0\n")
 
     def test_3d_matrix(self):
-        src = """set cube to empty matrix 2 by 2 by 2 of number
+        src = """set cube to empty matrix 2 by 2 by 2 of i64
 set cube[0, 0, 0] to 1
 set cube[1, 1, 1] to 8
 print length of cube
@@ -902,6 +902,51 @@ print cube[0, 0, 0]
 print cube[1, 1, 1]
 """
         self.assertEqual(run_capture(src), "8\n1\n8\n")
+
+    def test_4d_matrix(self):
+        src = """set t to empty matrix 2 by 2 by 2 by 2 of i64
+set t[0, 0, 0, 0] to 1
+set t[1, 1, 1, 1] to 16
+print length of t
+print t[0, 0, 0, 0]
+print t[1, 1, 1, 1]
+"""
+        self.assertEqual(run_capture(src), "16\n1\n16\n")
+
+    def test_3d_matrix_default_zeroed(self):
+        src = """set cube to empty matrix 2 by 3 by 4 of i64
+print cube[0, 0, 0]
+print cube[1, 2, 3]
+print length of cube
+"""
+        self.assertEqual(run_capture(src), "0\n0\n24\n")
+
+    def test_rows_columns_read_from_descriptor(self):
+        # `rows of m` and `columns of m` should reflect the actual stored
+        # shape — that's what the descriptor provides.
+        src = """set g to empty matrix 5 by 7 of i64
+print rows of g
+print columns of g
+"""
+        self.assertEqual(run_capture(src), "5\n7\n")
+
+    def test_3d_iterate_flat(self):
+        src = """set cube to empty matrix 2 by 2 by 2 of i64
+set cube[0, 0, 0] to 1
+set cube[0, 0, 1] to 2
+set cube[0, 1, 0] to 3
+set cube[0, 1, 1] to 4
+set cube[1, 0, 0] to 5
+set cube[1, 0, 1] to 6
+set cube[1, 1, 0] to 7
+set cube[1, 1, 1] to 8
+set total to 0
+repeat for each v in cube
+    add v to total
+end
+print total
+"""
+        self.assertEqual(run_capture(src), "36\n")
 
     def test_matrix_of_text(self):
         src = """set labels to empty matrix 2 by 2 of text

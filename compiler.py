@@ -634,6 +634,21 @@ class Compiler:
         self.emit(Opcode.MAP_SET, (1, 2, 0))
 
     def compile_set_matrix(self, name: str, em: EmptyMatrix) -> None:
+        """Allocate a matrix as TWO heap blocks:
+
+          - Descriptor: `[data_ptr, dim0, dim1, ..., dim(rank-1)]` — the
+            matrix variable points here. `rows of m` is `LOAD_AT(m, 1)`,
+            `columns of m` is `LOAD_AT(m, 2)`, etc. Generic axis lookup
+            works for any rank.
+          - Data: a flat row-major block of `cells * elem_size` slots,
+            referenced from descriptor[0]. Indexing follows the existing
+            stride math against this pointer.
+
+        The compiler still tracks shape statically for fast indexing in
+        the common case; the descriptor is what makes shape queryable
+        (and would let a function take a matrix arg whose shape isn't
+        known statically — future feature).
+        """
         shape = []
         for d in em.dims:
             if not (isinstance(d, NumberLit) and isinstance(d.value, int)):
@@ -641,11 +656,10 @@ class Compiler:
                     "matrix dimensions must be integer literals in v1"
                 )
             shape.append(d.value)
-        if len(shape) != 2:
-            raise CompileError("only 2D matrices supported in v1")
+        if len(shape) < 1:
+            raise CompileError("matrix must have at least one dimension")
+        rank = len(shape)
 
-        # If the elements are records, allocate enough room for `cells * K`
-        # slots so that record bodies sit packed inline.
         elem_rec_name = (
             em.elem_type.name
             if em.elem_type.name in self.module.records else None
@@ -653,39 +667,58 @@ class Compiler:
         elem_size = (
             self.module.records[elem_rec_name].size if elem_rec_name else 1
         )
-        cells = shape[0] * shape[1]
-        total = cells * elem_size
-        self.emit(Opcode.ALLOC, (0, total))
+        cells = 1
+        for d in shape:
+            cells *= d
+        data_total = cells * elem_size
 
-        # Initialize each cell. ALLOC zero-fills with None, which would
-        # surface as the literal "None" on `print g[i,j]`. Numeric cells
-        # get the type's zero, text/ref cells get a fresh empty array,
-        # record cells are zeroed recursively per-field.
+        # r0 will hold the descriptor pointer; r1 the data pointer; r2/r3
+        # are scratch for value/offset stores.
+        self.emit(Opcode.ALLOC, (0, 1 + rank))   # descriptor
+        self.emit(Opcode.ALLOC, (1, data_total)) # data
+
+        # descriptor[0] = data_ptr
+        zero_addr = self.allocate_constant(0)
+        self.emit(Opcode.LOAD, (3, zero_addr))
+        self.emit(Opcode.STORE_AT, (1, 0, 3))
+
+        # descriptor[i+1] = shape[i] for each dim
+        for i, dim_value in enumerate(shape):
+            slot_addr = self.allocate_constant(i + 1)
+            dim_addr = self.allocate_constant(dim_value)
+            self.emit(Opcode.LOAD, (2, dim_addr))
+            self.emit(Opcode.LOAD, (3, slot_addr))
+            self.emit(Opcode.STORE_AT, (2, 0, 3))
+
+        # Initialize each data cell against r1 (data block). ALLOC zero-
+        # fills with None, which would surface as the literal "None" on
+        # `print g[i,j]`. Numeric cells get the type's zero, text/ref
+        # cells get a fresh empty array, record cells are zeroed
+        # recursively per-field.
         elem_type_code = self.typeref_to_elem_code(em.elem_type)
         if elem_rec_name is not None:
             layout = self.module.records[elem_rec_name]
             for cell in range(cells):
                 self._init_record_at(
-                    ptr_reg=0, layout=layout,
+                    ptr_reg=1, layout=layout,
                     base_offset=cell * elem_size,
-                    scratch_val=1, scratch_off=2,
+                    scratch_val=2, scratch_off=3,
                 )
         else:
             if elem_type_code == TypeCode.TEXT or elem_type_code == TypeCode.REF:
-                # Each cell gets its own fresh empty array.
-                for slot in range(total):
-                    self.emit(Opcode.ALLOC, (1, 0))
+                for slot in range(data_total):
+                    self.emit(Opcode.ALLOC, (2, 0))
                     slot_addr = self.allocate_constant(slot)
-                    self.emit(Opcode.LOAD, (2, slot_addr))
-                    self.emit(Opcode.STORE_AT, (1, 0, 2))
+                    self.emit(Opcode.LOAD, (3, slot_addr))
+                    self.emit(Opcode.STORE_AT, (2, 1, 3))
             else:
                 default = self._default_for_field(elem_type_code)
                 default_addr = self.allocate_constant(default)
-                self.emit(Opcode.LOAD, (1, default_addr))
-                for slot in range(total):
+                self.emit(Opcode.LOAD, (2, default_addr))
+                for slot in range(data_total):
                     slot_addr = self.allocate_constant(slot)
-                    self.emit(Opcode.LOAD, (2, slot_addr))
-                    self.emit(Opcode.STORE_AT, (1, 0, 2))
+                    self.emit(Opcode.LOAD, (3, slot_addr))
+                    self.emit(Opcode.STORE_AT, (2, 1, 3))
 
         if name in self.module.symbol_table:
             if self.module.symbol_types[name] != TypeCode.REF:
@@ -694,11 +727,11 @@ class Compiler:
         else:
             addr = self.allocate_variable(name, TypeCode.REF)
 
-        # Shape and element type — purely compile-time metadata.
         self.module.symbol_shapes[name] = tuple(shape)
         self.module.symbol_elem_types[name] = elem_type_code
         if elem_rec_name is not None:
             self.module.symbol_elem_record_types[name] = elem_rec_name
+        # Bind the matrix variable to the DESCRIPTOR pointer.
         self.emit(Opcode.STORE, (0, addr))
 
     def compile_matrix_get(self, expr: IndexAccess, reg: int) -> TypeCode:
@@ -999,9 +1032,23 @@ class Compiler:
         """Materialize the pointer in `ptr_reg` and the slot offset in
         `off_reg`. `scratch` and `scratch+1` are used for index*stride math.
         Caller must ensure these registers don't collide with anything live.
+
+        For matrix-rooted chains, the variable holds a pointer to a
+        DESCRIPTOR block — `[data_ptr, dim0, dim1, ...]`. Before the
+        index math runs, dereference descriptor[0] so `ptr_reg` points
+        at the actual data block.
         """
         addr = self.module.symbol_table[ca.root]
         self.emit(Opcode.LOAD, (ptr_reg, addr))
+
+        # Matrix descriptor → data pointer. We do this whenever the chain
+        # roots in a matrix and actually steps into data (i.e., there are
+        # dynamic terms). Without an indexing step we'd be returning the
+        # descriptor itself, which is what RowsExpr/ColumnsExpr want.
+        if ca.root in self.module.symbol_shapes and ca.dynamic_terms:
+            zero_addr = self.allocate_constant(0)
+            self.emit(Opcode.LOAD, (scratch, zero_addr))
+            self.emit(Opcode.LOAD_AT, (ptr_reg, ptr_reg, scratch))
 
         static_addr = self.allocate_constant(ca.static_offset)
         self.emit(Opcode.LOAD, (off_reg, static_addr))
@@ -1116,6 +1163,23 @@ class Compiler:
         if ty == TypeCode.BOOL:
             return False
         return None   # TEXT/REF handled separately via ALLOC
+
+    def _emit_axis_load(self, value_expr, axis: int, reg: int) -> TypeCode:
+        """Emit code that loads `shape[axis]` of a matrix expression into
+        `reg`. The matrix variable points at the descriptor block, where
+        slot 0 holds the data pointer and slots 1..rank hold the
+        dimensions; we read slot `axis + 1`."""
+        shape = self._matrix_shape_of(value_expr)
+        if axis < 0 or axis >= len(shape):
+            raise CompileError(
+                f"axis {axis} out of range for {len(shape)}-D matrix"
+            )
+        # Compile the matrix expression; result is the descriptor pointer.
+        self.compile_expr_into(value_expr, reg + 1)
+        slot_addr = self.allocate_constant(axis + 1)
+        self.emit(Opcode.LOAD, (reg + 2, slot_addr))
+        self.emit(Opcode.LOAD_AT, (reg, reg + 1, reg + 2))
+        return TypeCode.I64
 
     def _matrix_shape_of(self, expr) -> tuple[int, ...]:
         if not isinstance(expr, VarRef):
@@ -1266,10 +1330,23 @@ class Compiler:
             return self.compile_new_record_inline(expr, reg)
 
         if isinstance(expr, LengthExpr):
+            # `length of m` for a matrix returns the total cell count.
+            # The descriptor doesn't store this directly, but the shape
+            # is statically known per matrix variable, so emit the
+            # constant. For other containers, fall through to LEN.
+            if isinstance(expr.value, VarRef):
+                shape = self.module.symbol_shapes.get(expr.value.name)
+                if shape is not None:
+                    cells = 1
+                    for d in shape:
+                        cells *= d
+                    addr = self.allocate_constant(cells)
+                    self.emit(Opcode.LOAD, (reg, addr))
+                    return TypeCode.I64
+
             self.compile_expr_into(expr.value, reg + 1)
             self.emit(Opcode.LEN, (reg, reg + 1))
-            # If the container holds records, the raw slot count is N*K.
-            # Divide by K so the user sees the record count.
+            # If a list holds records, raw slot count is N*K — divide by K.
             elem_rec = None
             if isinstance(expr.value, VarRef):
                 elem_rec = self.module.symbol_elem_record_types.get(expr.value.name)
@@ -1286,18 +1363,15 @@ class Compiler:
             return TypeCode.I64
 
         if isinstance(expr, RowsExpr):
-            shape = self._matrix_shape_of(expr.value)
-            addr = self.allocate_constant(shape[0])
-            self.emit(Opcode.LOAD, (reg, addr))
-            return TypeCode.I64
+            # Read shape[0] from descriptor slot 1.
+            return self._emit_axis_load(expr.value, axis=0, reg=reg)
 
         if isinstance(expr, ColumnsExpr):
             shape = self._matrix_shape_of(expr.value)
             if len(shape) < 2:
                 raise CompileError("matrix has no second dimension")
-            addr = self.allocate_constant(shape[1])
-            self.emit(Opcode.LOAD, (reg, addr))
-            return TypeCode.I64
+            # Read shape[1] from descriptor slot 2.
+            return self._emit_axis_load(expr.value, axis=1, reg=reg)
 
         raise CompileError(f"unsupported expression: {type(expr).__name__}")
 
@@ -1816,16 +1890,29 @@ class Compiler:
         self.emit(Opcode.LOAD,  (0, zero_addr))
         self.emit(Opcode.STORE, (0, idx_addr))
 
-        # cached_len = len(container) // K  (number of elements, not slots)
-        self.emit(Opcode.LOAD, (1, list_addr))
-        self.emit(Opcode.LEN,  (0, 1))
-        if K > 1:
-            k_addr = self.allocate_constant(K)
-            self.emit(Opcode.LOAD, (1, k_addr))
-            self.emit_convert(TypeCode.I64, TypeCode.F64, src=0, dst=0)
-            self.emit_convert(TypeCode.I64, TypeCode.F64, src=1, dst=1)
-            self.emit(Opcode.DIV_F64, (0, 0, 1))
-            self.emit_convert(TypeCode.F64, TypeCode.I64, src=0, dst=0)
+        # Matrices store shape in their descriptor block, not as a
+        # bare-data length, so use the compile-time-known cell count
+        # rather than emitting LEN.
+        matrix_shape = self.module.symbol_shapes.get(name)
+        is_matrix = matrix_shape is not None
+
+        if is_matrix:
+            cells = 1
+            for d in matrix_shape:
+                cells *= d
+            cells_addr = self.allocate_constant(cells)
+            self.emit(Opcode.LOAD,  (0, cells_addr))
+        else:
+            # cached_len = len(container) // K  (number of elements, not slots)
+            self.emit(Opcode.LOAD, (1, list_addr))
+            self.emit(Opcode.LEN,  (0, 1))
+            if K > 1:
+                k_addr = self.allocate_constant(K)
+                self.emit(Opcode.LOAD, (1, k_addr))
+                self.emit_convert(TypeCode.I64, TypeCode.F64, src=0, dst=0)
+                self.emit_convert(TypeCode.I64, TypeCode.F64, src=1, dst=1)
+                self.emit(Opcode.DIV_F64, (0, 0, 1))
+                self.emit_convert(TypeCode.F64, TypeCode.I64, src=0, dst=0)
         self.emit(Opcode.STORE, (0, len_addr))
 
         # Bind the loop variable. For primitive elements, `v` is a real
@@ -1861,6 +1948,12 @@ class Compiler:
         # don't need a refresh — the view-alias dispatches directly.
         if elem_rec_name is None:
             self.emit(Opcode.LOAD,    (1, list_addr))
+            if is_matrix:
+                # Matrix variable points at the descriptor; dereference
+                # descriptor[0] to get the actual data pointer.
+                deref_zero = self.allocate_constant(0)
+                self.emit(Opcode.LOAD,    (3, deref_zero))
+                self.emit(Opcode.LOAD_AT, (1, 1, 3))
             self.emit(Opcode.LOAD,    (2, idx_addr))
             self.emit(Opcode.LOAD_AT, (0, 1, 2))
             self.emit(Opcode.STORE,   (0, var_addr))

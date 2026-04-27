@@ -2,6 +2,8 @@
 [x] add "and" and "or"
 [x] remake benchmarks
 [x] add type conversions
+[ ] add imports
+[ ] implement few libraries to look like real language
 [ ] rows of / columns of only make sense for 2D+. For 3D+, you'd want size of m at dimension N or a shape of m returning a list. Leaving for when you actually need it.
 
 
