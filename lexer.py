@@ -54,6 +54,12 @@ KEYWORDS = {
     "true", "false", "none",
     "bit_and", "bit_or", "bit_not",
     "xor", "shifted", "left", "right",
+    # Module system: `use "math"` for language libraries, `import "utils"`
+    # for local files. `from` already exists (used by `subtract X from Y`),
+    # but it doubles as the prefix for selective imports:
+    #     from "math" use sqrt
+    #     from "utils" import helper
+    "use", "import",
 }
 
 

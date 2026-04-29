@@ -7,8 +7,11 @@ from bytecode import dump_module
 
 def run(source: str, show_bytecode: bool = False) -> None:
     tokens = tokenize(source)
-    stmts = Parser(source, tokens).parse_program()
-    module = compile_program(stmts)
+    program = Parser(source, tokens).parse_program()
+    # The import block is parsed but not yet processed — the loader will
+    # consume `program.imports` once it lands. For now compile only the
+    # statement body, which is the same code path as before.
+    module = compile_program(program.stmts)
     if show_bytecode:
         print(dump_module(module))
         print("=== output ===")

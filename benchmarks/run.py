@@ -31,8 +31,8 @@ def time_plainlang(source: str) -> float:
     up-front and excluded, matching how the language would be used in
     practice (compile once, run many times)."""
     tokens = tokenize(source)
-    stmts = Parser(source, tokens).parse_program()
-    module = compile_program(stmts)
+    program = Parser(source, tokens).parse_program()
+    module = compile_program(program.stmts)
     buf = StringIO()
     start = time.perf_counter()
     with redirect_stdout(buf):

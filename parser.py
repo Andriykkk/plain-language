@@ -258,6 +258,32 @@ class CallStmt:
     call: CallExpr
 
 
+# ---------- AST: imports ----------
+#
+# Imports live in their own block at the top of a file. Once any
+# non-import statement appears, the import block is closed and any
+# subsequent `import` is a parse error. This is what lets the loader
+# read just the prefix of a file to discover its dependencies.
+#
+# The schema starts minimal — `path` only — but the field is named so
+# future shapes (use vs import, alias, selective `from X import a,b`)
+# can be added without churn:
+#
+#   ImportStmt(path="utils")                    # `import "utils"`
+#   ImportStmt(path="utils", alias="u")         # future: `import "utils" as u`
+#   ImportStmt(path="utils", names=["x","y"])   # future: `from "utils" import x, y`
+#   ImportStmt(path="math", kind="use")         # future: `use "math"`
+@dataclass
+class ImportStmt:
+    path: str
+
+
+@dataclass
+class Program:
+    imports: list[ImportStmt]
+    stmts: list["Stmt"]
+
+
 Stmt = Union[
     SetStmt, AppendStmt,
     PrintStmt, IfStmt, RepeatTimesStmt, RepeatForEachStmt, RepeatRangeStmt,
@@ -384,13 +410,52 @@ class Parser:
 
     # ---- entry point ----
 
-    def parse_program(self) -> list[Stmt]:
+    def parse_program(self) -> Program:
+        """Top-level entry. The file is split into two sections: an
+        import block (zero or more `import "..."` lines) followed by
+        the statement body. Once a non-import statement is seen, the
+        import block is closed; any further `import` is an error."""
         self._skip_blank_lines()
+        imports = self.parse_imports_only()
+
         stmts: list[Stmt] = []
         while self.peek().kind != TK.EOF:
+            if self._is_import_start():
+                tok = self.peek()
+                raise ParseError(
+                    "imports must appear at the top of the file, "
+                    "before any other statements",
+                    tok,
+                )
             stmts.append(self.parse_statement())
             self._end_of_statement()
-        return stmts
+        return Program(imports=imports, stmts=stmts)
+
+    def parse_imports_only(self) -> list[ImportStmt]:
+        """Parse just the import block at the top of the file. Stops at
+        the first non-import statement. Used by the entry-point parser
+        and (later) by the loader's header-only pre-pass."""
+        self._skip_blank_lines()
+        imports: list[ImportStmt] = []
+        while self._is_import_start():
+            imports.append(self.parse_import_stmt())
+            self._end_of_statement()
+        return imports
+
+    def _is_import_start(self) -> bool:
+        """True if the next token starts an import statement. For now
+        only `import` qualifies — `use` and `from` will be added when
+        their parser productions land."""
+        tok = self.peek()
+        return tok.kind == TK.KEYWORD and self.text(tok) == "import"
+
+    def parse_import_stmt(self) -> ImportStmt:
+        """`import "<path>"` — the simplest form. Resolves to a local
+        file, relative to the importing file's directory."""
+        self.consume(TK.KEYWORD, "import")
+        path_tok = self.consume(TK.STRING)
+        path = decode_string(self.text(path_tok))
+        return ImportStmt(path=path)
 
     # ---- statements ----
 

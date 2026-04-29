@@ -1,10 +1,10 @@
-[ ] add to vm map and 3d matrices
+[x] add to vm map and 3d matrices
 [x] add "and" and "or"
 [x] remake benchmarks
 [x] add type conversions
 [ ] add imports
 [ ] implement few libraries to look like real language
-[ ] rows of / columns of only make sense for 2D+. For 3D+, you'd want size of m at dimension N or a shape of m returning a list. Leaving for when you actually need it.
+
 
 
 [X] Bitwise ops on integers (and, or, xor, <<, >>) — not parsed yet in the language either.
@@ -20,6 +20,12 @@ Bitwise ops on integers — both C-style symbols and word forms supported.
 Maps — empty map of text to number, set/get by key, length. No opcodes exist. Unblocks ~4 tests.
 
 # improves
+[ ] add templates to functions or records to con copy for each type
+[ ] add context with in custom syntax
+[ ] add custom syntax
+[ ] detect circular imports and allow some things
+[ ] remake matrices as library in custom syntax, not internal object
+[ ] rows of / columns for matrices. Slices with copies and slices
 [ ] add separate functions to compare lists, matrices, fill them, etc
 [ ] add pointer values, to set records to list and properly print them(special variable in compiler know pointer size)
 [ ] add list initialisation
