@@ -1,3 +1,104 @@
+Mini-modules with merge-on-import — refined design
+OK, simpler than my last one. Each file produces a complete MiniModule (its compilation result). When file A imports file B, A's compiler doesn't know or care that B came from a separate file — it just copies B's compiled artifacts into A's own MiniModule and uses them as if A had defined them itself.
+
+The only difference between a local function call and an imported one is where the compiler looks for the symbol:
+
+Local call → A's own function table.
+Imported call → B's function table (which A has access to).
+Once the symbol is found and pulled into A's MiniModule, it's indistinguishable from anything else A wrote.
+
+What each file produces — one MiniModule
+A MiniModule is exactly your existing Module structure. Bytecode, memory, function table, record table, entry point. Nothing exotic. A file compiles into one of these completely independently — same compile pipeline you have today, just stops short of executing.
+
+The import mechanism — copy at first reference
+When file A's compiler is processing A's body and sees call utils.format with x:
+
+Look up format in utils's MiniModule. Found — it's a FunctionInfo with bytecode at some address in utils's code array, parameter signatures, return type.
+Copy it into A's MiniModule. That means:
+Append utils's format bytecode to the end of A's code array, with all its internal jumps/loads adjusted for the new offset.
+Copy any constants/globals that bytecode reads, into A's initial_memory, adjusting LOAD addresses.
+Recursively do the same for any other functions that format itself calls.
+Register format in A's function table under the qualified name utils.format.
+Emit the CALL in A's bytecode pointing at the now-local entry.
+After this, utils.format is physically present in A's MiniModule. Any further calls to it (from A or from any function A imports) just resolve to that local entry. No re-copying.
+
+The compiler doesn't have a special "this is an import" code path beyond the symbol lookup phase. Once the symbol is in A's tables, calling code is identical to calling A's own functions.
+
+What gets copied with a function
+The unit of copy is "function plus its dependencies":
+
+Its bytecode (with addresses fixed up).
+Constants it reads.
+Globals it touches.
+Records used in its parameters / return type / body.
+Other functions it calls (transitively).
+Because copying is transitive, the first reference to utils.format brings along everything format needs to actually run.
+
+The address fixup
+Each instruction in B that has an absolute address — branch target, function entry address, memory slot — needs to be rewritten when copied into A. Two ways:
+
+Walk B's instructions during copy, look up each address against B's symbol metadata, write the equivalent address in A's space.
+Or: keep B's bytecode as ASTs (the parsed function bodies) and re-emit them into A. No address arithmetic, just rerun emission.
+Either works. Re-emission from AST is simpler to implement; address rewriting is faster at scale. For v1, re-emission is the right call — it reuses your existing emission code unchanged.
+
+So a MiniModule actually carries both its bytecode AND the AST of its functions. The import-copy step re-emits the AST into the destination's bytecode space.
+
+Idempotency
+If A's main calls utils.format (which copies it in), and then A's helper also calls utils.format, the second call doesn't re-copy. A's function table already has utils.format registered → just emit a CALL to that entry.
+
+Same applies across import paths: if A imports both utils and helpers, and both reference math.sqrt, math.sqrt ends up in A's MiniModule once, not twice. The "copy if not already present" check is by qualified name.
+
+Loader's role
+Unchanged from before. Loader walks the import graph from the entry file, produces a topo-sorted list. Compiler then processes them in order:
+
+Compile each file into its own MiniModule, in topo order. By the time A is being compiled, B's MiniModule already exists and is ready to be referenced.
+When A's compilation references utils.X, the lookup goes to utils's MiniModule (which the compiler has access to), and the copy-in happens.
+The final output is the entry file's MiniModule, with everything transitively pulled in. That's the runnable program.
+
+The mental model
+Each file is its own complete program (its MiniModule).
+import makes another module's symbols available for lookup.
+The compiler doesn't distinguish between a local function and an imported one once the import is resolved — both end up in the same function table, addressed identically in bytecode.
+Lookup path is the only difference: bare names go to local tables first; qualified names (utils.X) go to the named import's MiniModule.
+When a symbol is actually used, it's copied into the current MiniModule — which is what makes this file genuinely self-contained as a compilation unit.
+What to implement
+Loader produces topo-sorted file list (already planned).
+Compiler runs once per file. Each invocation produces a complete MiniModule (current Module struct with the AST attached).
+A registry: compiled[qualifier] = MiniModule. Populated as files are compiled in topo order.
+When the compiler is processing file A's body and encounters a qualified reference (e.g., call utils.format with x):
+Resolve utils via A's per-file alias map → qualifier.
+If utils.format is not yet in A's local function table: copy it from compiled["utils"] (re-emit from AST into A's MiniModule, transitively pulling in dependencies).
+Emit the local CALL.
+After all files are compiled, the entry file's MiniModule is the final program.
+Each file's compilation is independent in the sense that you could compile and check it in isolation; cross-file references just become "external symbols" that get satisfied by lookup-and-copy when this file is later consumed by another.
+
+What's deliberately not in this design
+Real linker-style address relocation (we re-emit instead).
+Caching MiniModules across runs.
+Pre-compiled distribution.
+Mutual recursion across files (still requires topo-sortable graph for now).
+Those are all extensions of this same architecture — they don't require rethinking it.
+
+TL;DR
+Each file → MiniModule (bytecode + memory + function/record tables + ASTs). Loader produces topo order. Compiler processes in order, emitting one MiniModule per file. Cross-file references trigger a copy: re-emit the imported function (and its dependencies) from AST into the current MiniModule. After copy, the function is local — same lookup, same call mechanism. Final program is the entry file's MiniModule.
+
+The compiler's only special handling for imports is at name-resolution time: where does it look up utils.format? In utils's MiniModule, then copy it in. Everything else — emission, calling convention, runtime — is identical to single-file compilation.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Imports — implementation plan
 
 Goal for this round: make `use "..."` and `import "..."` work end-to-end

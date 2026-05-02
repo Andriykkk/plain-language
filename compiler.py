@@ -34,6 +34,57 @@ class LoopContext:
     continue_patches: list[int] = field(default_factory=list)
 
 
+# ----------------------------------------------------------------------------
+# Memory registry — symbolic IDs for everything that lives in `initial_memory`.
+#
+# During compilation, the compiler asks the registry for IDs instead of
+# concrete addresses. LOAD/STORE operands are IDs; the finalize pass walks
+# the registry, assigns each ID an actual slot, and rewrites every LOAD/STORE
+# operand to its concrete address.
+#
+# For single-file programs the ID-to-address mapping ends up as identity
+# (IDs are 0..N, addresses are 0..N), so there's no observable runtime
+# difference. The indirection exists so the import system can share IDs
+# across files cleanly — a constant referenced from two files keeps one
+# slot in the final memory layout because it kept one ID.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class _RegEntry:
+    """One slot in the memory registry. `value` is what should sit at that
+    slot in `initial_memory` after finalize; `name` and `type` are debug
+    metadata useful for `dump_module`."""
+    value: object = None
+    name: "str | None" = None
+    type: "TypeCode | None" = None
+
+
+class _MemoryRegistry:
+    def __init__(self) -> None:
+        self.next_id: int = 0
+        self.entries: dict[int, _RegEntry] = {}
+        # Filled by finalize: ID → concrete index in initial_memory.
+        self.address_of: dict[int, int] = {}
+
+    def alloc(self, value=None, name=None, type=None) -> int:
+        sym_id = self.next_id
+        self.next_id += 1
+        self.entries[sym_id] = _RegEntry(value=value, name=name, type=type)
+        return sym_id
+
+
+# Opcode → operand index that holds a memory ID (to be rewritten at finalize).
+# LOAD and STORE are the only opcodes that reference main-memory by absolute
+# slot. Everything else uses register indices, immediate sizes, branch
+# positions, or stack-frame offsets — none of which go through the registry.
+_MEMORY_ID_OPERAND_INDEX: dict = {}
+# Filled lazily once Opcode is in scope (module-level access patterns).
+def _build_memory_id_operand_table() -> None:
+    _MEMORY_ID_OPERAND_INDEX[Opcode.LOAD] = 1
+    _MEMORY_ID_OPERAND_INDEX[Opcode.STORE] = 1
+_build_memory_id_operand_table()
+
+
 @dataclass
 class _ChainAccess:
     """Result of walking a chain of FieldAccess / IndexAccess steps from
@@ -233,6 +284,10 @@ class Compiler:
         self.module: Module = Module()
         self.loop_stack: list[LoopContext] = []
         self._hidden_counter: int = 0
+        # Symbolic-memory IDs are issued from this registry. LOAD/STORE
+        # operands hold IDs during emission; `_finalize` rewrites them to
+        # concrete addresses after all top-level statements are compiled.
+        self.memory_reg = _MemoryRegistry()
         # Function table — populated as `define function` statements are
         # encountered. Compiled bodies live at the start of the bytecode,
         # before main entry.
@@ -287,6 +342,11 @@ class Compiler:
                 )
             old = self.module.code[instr_idx]
             self.module.code[instr_idx] = Instruction(old.op, (entry,), old.line)
+
+        # Resolve memory IDs to concrete `initial_memory` addresses and
+        # rewrite all LOAD/STORE operands. Until this point the operands
+        # held registry IDs; after this they're addresses the VM expects.
+        self._finalize()
 
         return self.module
 
@@ -2268,16 +2328,51 @@ class Compiler:
     # ----- memory layout -----
 
     def allocate_constant(self, value) -> int:
-        addr = len(self.module.initial_memory)
-        self.module.initial_memory.append(value)
-        return addr
+        """Returns a symbolic ID for the constant. The registry holds the
+        value; `_finalize` will assign it a concrete address in
+        `initial_memory`. Callers use the returned ID directly as a LOAD
+        operand — finalize rewrites it later."""
+        return self.memory_reg.alloc(value=value)
 
     def allocate_variable(self, name: str, ty: TypeCode) -> int:
-        addr = len(self.module.initial_memory)
-        self.module.initial_memory.append(None)
-        self.module.symbol_table[name] = addr
+        """Returns a symbolic ID for the variable's storage slot. The
+        registry remembers the name/type for debugging; `_finalize`
+        will assign the actual address. `symbol_table` keeps the ID
+        until finalize, then is rewritten to hold the address (so
+        `dump_module` and other debug paths see post-finalize state)."""
+        sym_id = self.memory_reg.alloc(value=None, name=name, type=ty)
+        self.module.symbol_table[name] = sym_id
         self.module.symbol_types[name] = ty
-        return addr
+        return sym_id
+
+    def _finalize(self) -> None:
+        """Resolve every memory ID to a concrete address in
+        `initial_memory`, then rewrite all LOAD/STORE operands. Runs
+        once, after the last top-level statement is compiled."""
+        # 1. Walk registry in ID order, append values, record addresses.
+        for sym_id in sorted(self.memory_reg.entries.keys()):
+            entry = self.memory_reg.entries[sym_id]
+            addr = len(self.module.initial_memory)
+            self.module.initial_memory.append(entry.value)
+            self.memory_reg.address_of[sym_id] = addr
+
+        # 2. Rewrite LOAD/STORE operands from IDs to addresses.
+        for i, instr in enumerate(self.module.code):
+            idx = _MEMORY_ID_OPERAND_INDEX.get(instr.op)
+            if idx is None:
+                continue
+            operands = list(instr.operands)
+            old_id = operands[idx]
+            operands[idx] = self.memory_reg.address_of[old_id]
+            self.module.code[i] = Instruction(
+                instr.op, tuple(operands), instr.line
+            )
+
+        # 3. Rewrite the debug symbol_table to hold addresses (instead
+        #    of the IDs it was tracking during compilation). The runtime
+        #    doesn't consult symbol_table; this is purely for dumps.
+        for name, sym_id in list(self.module.symbol_table.items()):
+            self.module.symbol_table[name] = self.memory_reg.address_of[sym_id]
 
     # ----- emission -----
 
