@@ -1,8 +1,5 @@
-[x] add to vm map and 3d matrices
-[x] add "and" and "or"
-[x] remake benchmarks
-[x] add type conversions
 [ ] add imports
+    [ ] fix records so they was not visible globally
 [ ] implement few libraries to look like real language
 
 

@@ -1,88 +1,101 @@
-Mini-modules with merge-on-import — refined design
-OK, simpler than my last one. Each file produces a complete MiniModule (its compilation result). When file A imports file B, A's compiler doesn't know or care that B came from a separate file — it just copies B's compiled artifacts into A's own MiniModule and uses them as if A had defined them itself.
+1. Loader — file walking + cycle detection
+A small recursive driver that:
 
-The only difference between a local function call and an imported one is where the compiler looks for the symbol:
+Takes the entry file path.
+Reads, lexes, parses just the import block (using parse_imports_only you already have).
+For each import, resolves the path (relative to the importing file's directory; append .plang).
+Recurses into each imported file.
+Cycle detection via "currently being processed" set; error if we hit a file already in progress.
+Dedupe via "already loaded" set; skip if seen.
+Output: a list of files, each with its full parsed AST, in post-order — deepest dependencies first, entry file last.
 
-Local call → A's own function table.
-Imported call → B's function table (which A has access to).
-Once the symbol is found and pulled into A's MiniModule, it's indistinguishable from anything else A wrote.
+This is purely orchestration; doesn't touch the compiler yet.
 
-What each file produces — one MiniModule
-A MiniModule is exactly your existing Module structure. Bytecode, memory, function table, record table, entry point. Nothing exotic. A file compiles into one of these completely independently — same compile pipeline you have today, just stops short of executing.
+2. Per-file scope state in the compiler
+Currently Compiler has one global functions dict, one symbol_table, one set of records. After the refactor it needs to know which file is currently being compiled so it can:
 
-The import mechanism — copy at first reference
-When file A's compiler is processing A's body and sees call utils.format with x:
+Register that file's definitions under the file's qualifier (e.g., math.sqrt, not bare sqrt).
+Resolve qualified references like math.sqrt from the current file's import block.
+Resolve unqualified references first against the current file's local symbols, then against from "x" import y direct imports.
+A small FileContext struct holds:
 
-Look up format in utils's MiniModule. Found — it's a FunctionInfo with bytecode at some address in utils's code array, parameter signatures, return type.
-Copy it into A's MiniModule. That means:
-Append utils's format bytecode to the end of A's code array, with all its internal jumps/loads adjusted for the new offset.
-Copy any constants/globals that bytecode reads, into A's initial_memory, adjusting LOAD addresses.
-Recursively do the same for any other functions that format itself calls.
-Register format in A's function table under the qualified name utils.format.
-Emit the CALL in A's bytecode pointing at the now-local entry.
-After this, utils.format is physically present in A's MiniModule. Any further calls to it (from A or from any function A imports) just resolve to that local entry. No re-copying.
+The file's qualifier (basename of path, or alias if as was used).
+Path → qualifier map for qualified references.
+Direct-imports map for unqualified references brought in via from "x" import y.
+3. Compiler compile_file driver
+Replace today's "compile_program(stmts) → Module" with "compile_file(path) → MiniModule." Internally:
 
-The compiler doesn't have a special "this is an import" code path beyond the symbol lookup phase. Once the symbol is in A's tables, calling code is identical to calling A's own functions.
+Loader gives back the loaded files in topo order.
+Compiler iterates the order. For each file:
+Set up its FileContext.
+Compile its top-level statements into the shared Module (one Module being built across all files).
+Definitions go in under qualified names.
+Cross-file references resolve through FileContext to the right qualified name.
+The end of the iteration is the entry file — its top-level executable statements run after all dependencies' top-level code.
 
-What gets copied with a function
-The unit of copy is "function plus its dependencies":
+4. Qualified naming throughout the symbol tables
+The compiler's existing tables — functions, symbol_table, symbol_types, symbol_record_types, records — currently use bare names. They become qualified-name keyed:
 
-Its bytecode (with addresses fixed up).
-Constants it reads.
-Globals it touches.
-Records used in its parameters / return type / body.
-Other functions it calls (transitively).
-Because copying is transitive, the first reference to utils.format brings along everything format needs to actually run.
+math.sqrt instead of sqrt.
+math.PI instead of PI.
+math.Vector instead of Vector.
+When the compiler is processing a function body and looks up helper (an unqualified name in the file's own scope), it asks the FileContext to resolve helper → currentfile.helper, then looks up the qualified name in the table.
 
-The address fixup
-Each instruction in B that has an absolute address — branch target, function entry address, memory slot — needs to be rewritten when copied into A. Two ways:
+When it looks up math.sqrt, it splits on dot, resolves the prefix via FileContext's path-to-qualifier map, then does the qualified lookup.
 
-Walk B's instructions during copy, look up each address against B's symbol metadata, write the equivalent address in A's space.
-Or: keep B's bytecode as ASTs (the parsed function bodies) and re-emit them into A. No address arithmetic, just rerun emission.
-Either works. Re-emission from AST is simpler to implement; address rewriting is faster at scale. For v1, re-emission is the right call — it reuses your existing emission code unchanged.
+5. Path/dot grammar in the parser
+Currently math.sqrt parses as FieldAccess(VarRef("math"), "sqrt") — your existing record-field syntax. That's a real ambiguity with imported function calls.
 
-So a MiniModule actually carries both its bytecode AND the AST of its functions. The import-copy step re-emits the AST into the destination's bytecode space.
+Two options:
 
-Idempotency
-If A's main calls utils.format (which copies it in), and then A's helper also calls utils.format, the second call doesn't re-copy. A's function table already has utils.format registered → just emit a CALL to that entry.
+The parser still produces FieldAccess. The compiler interprets obj.name as a qualified lookup first, falling through to record field access if the prefix isn't an imported file alias.
+Add explicit qualified-name syntax (e.g., math::sqrt) that's distinct from field access. More work; less ambiguity.
+The first option is what most languages do (Python, JS) and feels more natural here. It's also less invasive — no parser change.
 
-Same applies across import paths: if A imports both utils and helpers, and both reference math.sqrt, math.sqrt ends up in A's MiniModule once, not twice. The "copy if not already present" check is by qualified name.
+6. Memory registry stays as-is
+The work you just finished (the _MemoryRegistry with finalize pass) is already what enables this. The registry is shared across all file compilations within a single compile_file invocation. So:
 
-Loader's role
-Unchanged from before. Loader walks the import graph from the entry file, produces a topo-sorted list. Compiler then processes them in order:
+File A allocates math.PI → ID 5.
+File B references math.PI → looks up its qualified name in some "named slots" table → finds ID 5 → emits LOAD with ID 5.
+After all files compile, finalize runs once, assigns one address to ID 5.
+But: there's a missing piece. Today, allocate_constant(value) always creates a fresh ID. For set PI to 3.14 to allocate ID 5 once and have all references find that same ID, the compiler needs a "named registration" path — when registering a global by qualified name, look up the registry for an existing entry by that name; only allocate a new ID if missing.
 
-Compile each file into its own MiniModule, in topo order. By the time A is being compiled, B's MiniModule already exists and is ready to be referenced.
-When A's compilation references utils.X, the lookup goes to utils's MiniModule (which the compiler has access to), and the copy-in happens.
-The final output is the entry file's MiniModule, with everything transitively pulled in. That's the runnable program.
+So the registry grows a by_name: dict[qualified_name → id] index alongside entries. Allocation methods get a flavor that says "this is a named global; reuse its ID if already registered."
 
-The mental model
-Each file is its own complete program (its MiniModule).
-import makes another module's symbols available for lookup.
-The compiler doesn't distinguish between a local function and an imported one once the import is resolved — both end up in the same function table, addressed identically in bytecode.
-Lookup path is the only difference: bare names go to local tables first; qualified names (utils.X) go to the named import's MiniModule.
-When a symbol is actually used, it's copied into the current MiniModule — which is what makes this file genuinely self-contained as a compilation unit.
-What to implement
-Loader produces topo-sorted file list (already planned).
-Compiler runs once per file. Each invocation produces a complete MiniModule (current Module struct with the AST attached).
-A registry: compiled[qualifier] = MiniModule. Populated as files are compiled in topo order.
-When the compiler is processing file A's body and encounters a qualified reference (e.g., call utils.format with x):
-Resolve utils via A's per-file alias map → qualifier.
-If utils.format is not yet in A's local function table: copy it from compiled["utils"] (re-emit from AST into A's MiniModule, transitively pulling in dependencies).
-Emit the local CALL.
-After all files are compiled, the entry file's MiniModule is the final program.
-Each file's compilation is independent in the sense that you could compile and check it in isolation; cross-file references just become "external symbols" that get satisfied by lookup-and-copy when this file is later consumed by another.
+7. Function entries through the registry too
+Today FunctionInfo.entry is a direct bytecode address. For cross-file function calls to work cleanly under the same model, function entries should also be resolvable by qualified name. Two options:
 
-What's deliberately not in this design
-Real linker-style address relocation (we re-emit instead).
-Caching MiniModules across runs.
-Pre-compiled distribution.
-Mutual recursion across files (still requires topo-sortable graph for now).
-Those are all extensions of this same architecture — they don't require rethinking it.
+Keep direct addresses. Cross-file calls work because all files compile into one shared Module's code array, and after compiling utils, the compiler knows utils.format's address. main's compilation looks it up directly.
+Route through a "function registry" similar to memory. Function symbols get IDs; finalize resolves to addresses.
+The first is simpler and works fine for the "shared Module" approach (which you already have via _finalize). No need to extend the registry for this.
 
-TL;DR
-Each file → MiniModule (bytecode + memory + function/record tables + ASTs). Loader produces topo order. Compiler processes in order, emitting one MiniModule per file. Cross-file references trigger a copy: re-emit the imported function (and its dependencies) from AST into the current MiniModule. After copy, the function is local — same lookup, same call mechanism. Final program is the entry file's MiniModule.
+8. What the entry point does
+run.py changes from:
 
-The compiler's only special handling for imports is at name-resolution time: where does it look up utils.format? In utils's MiniModule, then copy it in. Everything else — emission, calling convention, runtime — is identical to single-file compilation.
+
+parse → compile_program(stmts) → execute(module)
+to:
+
+
+loader.load(entry_path) → compile_files(loaded_files) → execute(module)
+The compile step takes all files in topo order, walks them, builds one Module. The runtime is unchanged.
+
+9. Tests to add
+Two files where one imports the other, calls a function across files.
+Imported global (e.g., set PI to 3.14) is referenced from another file via math.PI.
+Diamond import (A imports B and C, both import D; D loaded once).
+Circular import detection — clear error.
+File not found — clear error.
+Imported record used in a parameter / field access.
+What changes per piece, very roughly
+Loader (new file): ~80 lines.
+FileContext (new dataclass): ~15 lines.
+Compiler restructure to take a list of files instead of one stmt list, walk them in order, manage FileContext per file: ~30 lines refactor + ~20 lines new.
+Qualified naming in symbol tables: existing dict keys change; lookups go through a small resolver helper. ~40 lines.
+Registry by-name indexing for globals: ~10 lines.
+Resolver for obj.name chains: a few lines in the chain walker to check the alias map before treating it as a record-field access. ~15 lines.
+compile_file driver function: ~20 lines.
+run.py integration: 5 lines.
 
 
 
