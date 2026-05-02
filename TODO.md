@@ -1,4 +1,4 @@
-[ ] add imports
+[x] add imports
     [ ] fix records so they was not visible globally
 [ ] implement few libraries to look like real language
 
@@ -28,6 +28,7 @@ Maps — empty map of text to number, set/get by key, length. No opcodes exist. 
 [ ] add list initialisation
 [ ] make better functions input and output
 [ ] add debuger and parser to show what types during coding
+[ ] fix that whole code saved without eliminating dead code
 
 # future
 [ ] add array of structures or structure of arrays to choose when allocate

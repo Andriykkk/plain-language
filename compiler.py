@@ -78,11 +78,48 @@ class _MemoryRegistry:
 # slot. Everything else uses register indices, immediate sizes, branch
 # positions, or stack-frame offsets — none of which go through the registry.
 _MEMORY_ID_OPERAND_INDEX: dict = {}
-# Filled lazily once Opcode is in scope (module-level access patterns).
-def _build_memory_id_operand_table() -> None:
+# Opcode → operand index that holds a function ID (to be rewritten at
+# finalize). Only CALL — every other control-flow opcode (JMP/JMPF/JMPT)
+# uses bytecode positions known at emit time, not symbolic IDs.
+_FUNCTION_ID_OPERAND_INDEX: dict = {}
+def _build_id_operand_tables() -> None:
     _MEMORY_ID_OPERAND_INDEX[Opcode.LOAD] = 1
     _MEMORY_ID_OPERAND_INDEX[Opcode.STORE] = 1
-_build_memory_id_operand_table()
+    _FUNCTION_ID_OPERAND_INDEX[Opcode.CALL] = 0
+_build_id_operand_tables()
+
+
+@dataclass
+class _FuncEntry:
+    """One slot in the function registry. `position` is the index in
+    `module.code` where the function's body starts; recorded by
+    `compile_function_def` as the body begins emitting. `-1` means the
+    body hasn't been emitted yet (transient state during pre-declare)."""
+    name: "str | None" = None
+    position: int = -1
+
+
+class _FunctionRegistry:
+    """Parallel to `_MemoryRegistry`, but for function entry points.
+
+    `_predeclare_function` allocates a fresh ID; once the function's
+    body emits, its position is written into `entries[id].position`.
+    CALL operands hold IDs throughout compilation; `_finalize` walks
+    every CALL and rewrites the ID to its concrete bytecode position.
+
+    Cross-file calls (when imports land) become trivial because IDs
+    are stable across the whole compilation: a CALL emitted in file A
+    uses the same ID as the function's entry, regardless of which file
+    actually compiled the body."""
+    def __init__(self) -> None:
+        self.next_id: int = 0
+        self.entries: dict[int, _FuncEntry] = {}
+
+    def alloc(self, name: "str | None" = None) -> int:
+        func_id = self.next_id
+        self.next_id += 1
+        self.entries[func_id] = _FuncEntry(name=name)
+        return func_id
 
 
 @dataclass
@@ -110,13 +147,18 @@ class _ChainAccess:
 
 @dataclass
 class FunctionInfo:
-    """Compile-time record of a function: where its body lives, what
-    arguments it takes (in declaration order), and what it returns.
-    Parameters live on the stack — the caller pushes them in order, so at
-    function entry the i-th parameter sits at offset (N - i) above the
-    return address."""
+    """Compile-time record of a function. `func_id` is a registry handle
+    issued at pre-declaration time; CALL operands hold this ID until the
+    finalize pass rewrites them to concrete bytecode positions.
+
+    `body_position` is filled in by `compile_function_def` once the body
+    starts emitting — it's the index in `module.code` where the function
+    begins. `-1` means "declared but body not yet compiled" (which only
+    matters internally during a body's own compilation; cross-file uses
+    always see a fully-emitted function)."""
     name: str
-    entry: int
+    func_id: int
+    body_position: int
     params: list[tuple[str, TypeCode]]
     return_type: TypeCode | None
 
@@ -288,6 +330,11 @@ class Compiler:
         # operands hold IDs during emission; `_finalize` rewrites them to
         # concrete addresses after all top-level statements are compiled.
         self.memory_reg = _MemoryRegistry()
+        # Symbolic function IDs. CALL operands hold IDs during emission;
+        # `_finalize` rewrites them to bytecode positions. IDs are stable
+        # from `_predeclare_function` onward, so forward references and
+        # mutual recursion work without any patch list.
+        self.function_reg = _FunctionRegistry()
         # Function table — populated as `define function` statements are
         # encountered. Compiled bodies live at the start of the bytecode,
         # before main entry.
@@ -304,11 +351,6 @@ class Compiler:
         # lazily on first function-related code; functions store their result
         # here on RET, callers LOAD it after CALL.
         self.return_slot_addr: int | None = None
-        # Forward calls — compile_call records (instr_idx, function_name) here
-        # whenever it emits a CALL whose target hasn't been compiled yet.
-        # Patched at the end of compile_program once every body's entry is
-        # known.
-        self.pending_call_patches: list[tuple[int, str]] = []
         # `repeat for each v in xs` over a list of records binds `v` as a
         # synthetic alias for `xs[idx]` rather than a real variable. The
         # chain walker dispatches through this map: when it sees `v` as the
@@ -319,12 +361,12 @@ class Compiler:
     # ----- entry -----
 
     def compile_program(self, stmts: list[Stmt]) -> Module:
-        # Pre-pass: register every top-level function name with a placeholder
-        # entry of -1. Bodies are compiled in source order; when a body emits
-        # a CALL to a function whose body hasn't been compiled yet, the CALL
-        # uses the -1 placeholder and is recorded in pending_call_patches.
-        # Patches are applied at the end once every entry is known.
-        # This is what enables forward references and mutual recursion.
+        # Pre-pass: register every top-level function name in the function
+        # registry, getting back a stable function ID. CALLs reference
+        # this ID throughout compilation; the body's bytecode position
+        # gets recorded as the body emits, and `_finalize` rewrites every
+        # CALL operand to that position. Forward references and mutual
+        # recursion fall out for free — IDs are stable from this point.
         for stmt in stmts:
             if isinstance(stmt, FunctionDef):
                 self._predeclare_function(stmt)
@@ -334,18 +376,9 @@ class Compiler:
             self.compile_stmt(stmt)
         self.emit(Opcode.HALT, ())
 
-        for instr_idx, fname in self.pending_call_patches:
-            entry = self.functions[fname].entry
-            if entry == -1:
-                raise CompileError(
-                    f"function {fname!r} was declared but never defined"
-                )
-            old = self.module.code[instr_idx]
-            self.module.code[instr_idx] = Instruction(old.op, (entry,), old.line)
-
-        # Resolve memory IDs to concrete `initial_memory` addresses and
-        # rewrite all LOAD/STORE operands. Until this point the operands
-        # held registry IDs; after this they're addresses the VM expects.
+        # Resolve memory and function IDs to concrete addresses, rewriting
+        # all LOAD/STORE/CALL operands. Until this point the operands held
+        # registry IDs; after this they're concrete numbers the VM expects.
         self._finalize()
 
         return self.module
@@ -359,8 +392,12 @@ class Compiler:
         return_type = (
             self.typeref_to_code(fd.return_type) if fd.return_type is not None else None
         )
+        # Reserve a stable function ID. The body's bytecode position is
+        # filled in by compile_function_def when the body starts emitting.
+        func_id = self.function_reg.alloc(name=fd.name)
         self.functions[fd.name] = FunctionInfo(
-            name=fd.name, entry=-1, params=params, return_type=return_type,
+            name=fd.name, func_id=func_id, body_position=-1,
+            params=params, return_type=return_type,
         )
 
     # ----- stack-tracking emission helpers -----
@@ -2084,14 +2121,14 @@ class Compiler:
             raise CompileError(
                 "nested function definitions aren't supported"
             )
-        # The pre-pass in compile_program registered this function with
-        # entry = -1; here we fill in the real entry once the body's
-        # position is known. If we got here without a pre-registration,
-        # this is a nested FunctionDef — caught above.
+        # The pre-pass in compile_program registered this function (gave
+        # it a stable ID with body_position = -1). Fill in the position
+        # now that the body is about to emit. If pre-declare didn't run
+        # (e.g., nested def — which we forbid above), do it lazily.
         if fd.name not in self.functions:
             self._predeclare_function(fd)
         info = self.functions[fd.name]
-        if info.entry != -1:
+        if info.body_position != -1:
             raise CompileError(f"function {fd.name!r} defined twice")
 
         # Functions are emitted inline in source order, so we need to jump
@@ -2099,7 +2136,11 @@ class Compiler:
         # the surrounding code would fall right into it.
         skip_idx = self.emit_placeholder_jump(Opcode.JMP)
 
-        info.entry = self.current_pos()
+        # Record the body's start position both on the FunctionInfo (for
+        # the rest of compilation) and on the registry entry (so
+        # `_finalize` can look it up by ID).
+        info.body_position = self.current_pos()
+        self.function_reg.entries[info.func_id].position = info.body_position
 
         prev_func, prev_indices, prev_delta = (
             self.current_func, self.param_indices, self.stack_delta
@@ -2146,14 +2187,11 @@ class Compiler:
                     )
             self.emit_push(0)
 
-        # If the callee's body hasn't been compiled yet, we don't know its
-        # entry. Emit CALL with a placeholder and remember the instruction
-        # index so compile_program can patch it after every body is laid
-        # out.
-        call_idx = self.current_pos()
-        self.emit(Opcode.CALL, (info.entry,))
-        if info.entry == -1:
-            self.pending_call_patches.append((call_idx, ce.name))
+        # Emit CALL with the function's stable registry ID. The body's
+        # final bytecode position is filled in by `_finalize`. Forward
+        # references work because IDs are assigned at pre-declare time,
+        # before any body emits.
+        self.emit(Opcode.CALL, (info.func_id,))
 
         # Pick up the result from the shared return slot, then drop the args.
         ret_slot = self._ensure_return_slot()
@@ -2346,29 +2384,46 @@ class Compiler:
         return sym_id
 
     def _finalize(self) -> None:
-        """Resolve every memory ID to a concrete address in
-        `initial_memory`, then rewrite all LOAD/STORE operands. Runs
-        once, after the last top-level statement is compiled."""
-        # 1. Walk registry in ID order, append values, record addresses.
+        """Resolve memory and function IDs to concrete addresses, then
+        rewrite all LOAD/STORE/CALL operands. Runs once, after the last
+        top-level statement is compiled."""
+        # 1. Memory: append each registry entry's value to initial_memory
+        #    and record its slot in address_of.
         for sym_id in sorted(self.memory_reg.entries.keys()):
             entry = self.memory_reg.entries[sym_id]
             addr = len(self.module.initial_memory)
             self.module.initial_memory.append(entry.value)
             self.memory_reg.address_of[sym_id] = addr
 
-        # 2. Rewrite LOAD/STORE operands from IDs to addresses.
+        # 2. Functions: every entry should already have its position
+        #    filled in by compile_function_def. Verify; flag any
+        #    pre-declared function whose body was never compiled (this
+        #    can happen later when imports are wired up and a function
+        #    is announced but never defined).
+        for func_id, fentry in self.function_reg.entries.items():
+            if fentry.position == -1:
+                raise CompileError(
+                    f"function {fentry.name!r} was declared but never defined"
+                )
+
+        # 3. Rewrite operands. LOAD/STORE → memory addresses; CALL → body
+        #    positions. Anything else is left alone.
         for i, instr in enumerate(self.module.code):
-            idx = _MEMORY_ID_OPERAND_INDEX.get(instr.op)
-            if idx is None:
+            mem_idx = _MEMORY_ID_OPERAND_INDEX.get(instr.op)
+            fn_idx  = _FUNCTION_ID_OPERAND_INDEX.get(instr.op)
+            if mem_idx is None and fn_idx is None:
                 continue
             operands = list(instr.operands)
-            old_id = operands[idx]
-            operands[idx] = self.memory_reg.address_of[old_id]
+            if mem_idx is not None:
+                operands[mem_idx] = self.memory_reg.address_of[operands[mem_idx]]
+            if fn_idx is not None:
+                func_id = operands[fn_idx]
+                operands[fn_idx] = self.function_reg.entries[func_id].position
             self.module.code[i] = Instruction(
                 instr.op, tuple(operands), instr.line
             )
 
-        # 3. Rewrite the debug symbol_table to hold addresses (instead
+        # 4. Rewrite the debug symbol_table to hold addresses (instead
         #    of the IDs it was tracking during compilation). The runtime
         #    doesn't consult symbol_table; this is purely for dumps.
         for name, sym_id in list(self.module.symbol_table.items()):
